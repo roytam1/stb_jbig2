@@ -675,23 +675,27 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
         iardx=sj_int_ctx_new(); iardy=sj_int_ctx_new();
         /* 6.4.5 (1): decode STRIPT */
         { int rc=sj_int_decode(iadt,as,&stript); if(rc) goto text_done; }
-        stript*=-(sj_i32)SBSTRIPS;
-        firsts=0;
-        /* 6.4.5 (3) */
-        while(ninstances<SBNUM) {
-            sj_i32 id; int ri=0;
-            /* 6.4.5 (3b): decode DT */
-            { int rc=sj_int_decode(iadt,as,&dt); if(rc) break; }
-            dt*=(sj_i32)SBSTRIPS; stript+=dt;
-            /* first symbol in strip */
-            { int rc=sj_int_decode(iafs,as,&dfs); if(rc) break; }
-            firsts+=dfs; curs=firsts;
-            for(;;) {
-                sj_i32 curt_val;
-                int sid=-1;
-                /* decode IDS */
-                { int rc=sj_int_decode(iads,as,&ids); if(rc<0) goto text_done; if(rc>0) break; }
-                curs+=ids+SBDSOFFSET;
+            stript*=-(sj_i32)SBSTRIPS;
+            firsts=0;
+            /* 6.4.5 (3) */
+            while(ninstances<SBNUM) {
+                sj_i32 id; int ri=0; int first_symbol=1;
+                /* 6.4.5 (3b): decode DT */
+                { int rc=sj_int_decode(iadt,as,&dt); if(rc) break; }
+                dt*=(sj_i32)SBSTRIPS; stript+=dt;
+                for(;;) {
+                    sj_i32 curt_val;
+                    int sid=-1;
+                    if(first_symbol) {
+                        /* 6.4.7: decode DFS */
+                        { int rc=sj_int_decode(iafs,as,&dfs); if(rc<0) goto text_done; if(rc>0) goto text_done; }
+                        firsts+=dfs; curs=firsts;
+                        first_symbol=0;
+                    } else {
+                        /* 6.4.8: decode IDS */
+                        { int rc=sj_int_decode(iads,as,&ids); if(rc<0) goto text_done; if(rc>0) break; }
+                        curs+=ids+SBDSOFFSET;
+                    }
                 /* decode CURT */
                 if(SBSTRIPS==1) curt_val=0;
                 else { int rc=sj_int_decode(iait,as,&curt_val); if(rc<0) goto text_done; if(rc>0) goto text_done; }
