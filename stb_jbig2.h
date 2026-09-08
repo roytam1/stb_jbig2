@@ -51,6 +51,7 @@ stb_jbig2_context *stb_jbig2_create_ex(int options, stb_jbig2_context *shared);
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 typedef unsigned char  sj_u8;
 typedef unsigned short sj_u16;
@@ -518,7 +519,7 @@ static int sj_decode_gb(stb_jbig2_image *im, sj_arith *as, sj_cx *ctx, int tpl, 
             pd<<=1; ppd<<=1;
             out=(out<<1)|bit; bits--;
             *d=(sj_u8)(out<<bits);
-            if (!bits) { bits=8; d++; if(x+9<W&&y>0){pd|=(sj_u32)im->data[(y-1)*im->stride+((x+8)>>3)];if(y>1)ppd|=(sj_u32)im->data[(y-2)*im->stride+((x+8)>>3)];} }
+            if (!bits) { bits=8; d++; if(x+9<W&&y>0){pd|=(sj_u32)im->data[(y-1)*im->stride+((x+9)>>3)];if(y>1)ppd|=(sj_u32)im->data[(y-2)*im->stride+((x+9)>>3)];} }
         }
         if (bits!=8) *d=(sj_u8)(out<<bits);
     }
@@ -673,13 +674,18 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
         iari=sj_int_ctx_new(); iaid=sj_iaid_new((sj_u8)iaidsz);
         iardw=sj_int_ctx_new(); iardh=sj_int_ctx_new();
         iardx=sj_int_ctx_new(); iardy=sj_int_ctx_new();
+        fprintf(stderr,"TEXT: sbnusyms=%u SBNUM=%u SBSTRIPS=%d SBREFINE=%d SBRTEMPLATE=%d\n",
+               sbnusyms,(unsigned)SBNUM,SBSTRIPS,SBREFINE,SBRTEMPLATE);
+        fprintf(stderr,"TEXT: d_off=%u data_len=%u\n",(unsigned)d_off,(unsigned)seg->data_len);
         /* 6.4.5 (1): decode STRIPT */
         { int rc=sj_int_decode(iadt,as,&stript); if(rc) goto text_done; }
+        fprintf(stderr,"TEXT: STRIPT=%d\n",(int)stript);
             stript*=-(sj_i32)SBSTRIPS;
             firsts=0;
             /* 6.4.5 (3) */
             while(ninstances<SBNUM) {
                 sj_i32 id; int ri=0; int first_symbol=1;
+                fprintf(stderr,"TEXT: strip iter ninst=%u stript=%d\n",ninstances,(int)stript);
                 /* 6.4.5 (3b): decode DT */
                 { int rc=sj_int_decode(iadt,as,&dt); if(rc) break; }
                 dt*=(sj_i32)SBSTRIPS; stript+=dt;
@@ -808,14 +814,20 @@ static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *
         iadh=sj_int_ctx_new(); iadw=sj_int_ctx_new();
         iaex=sj_int_ctx_new(); iaai=sj_int_ctx_new();
         hc_height=0; nsyms_decoded=0;
+        fprintf(stderr,"SYM_DICT: num_new=%u offset=%u data_len=%u\n",num_new_syms,(unsigned)offset,(unsigned)seg->data_len);
         while(nsyms_decoded<num_new_syms) {
             sj_i32 hcdh; sj_u32 dw;
             { int rc=sj_int_decode(iadh,as,&hcdh); if(rc<0) goto sym_done; if(rc>0) goto sym_done; }
+            fprintf(stderr,"  HCDH=%d nsyms=%u hc_height=%u\n",(int)hcdh,nsyms_decoded,hc_height);
             hc_height=(sj_u32)((sj_i32)hc_height+hcdh); sym_width=0; tot_width=0;
+            fprintf(stderr,"  -> new hc_height=%u\n",hc_height);
             for(;;) {
                 sj_i32 idw;
-                { int rc=sj_int_decode(iadw,as,&idw); if(rc<0) goto sym_done; if(rc>0) break; }
+                { int rc=sj_int_decode(iadw,as,&idw);
+                  fprintf(stderr,"    IADW: rc=%d idw=%d\n",rc,(int)idw);
+                  if(rc<0) goto sym_done; if(rc>0) break; }
                 dw=(sj_u32)idw; sym_width+=dw; tot_width+=sym_width;
+                fprintf(stderr,"    -> dw=%u sym_width=%u nsyms=%u\n",dw,sym_width,nsyms_decoded);
                 if(nsyms_decoded<num_new_syms) {
                     sj_i32 refagg_ninst=0;
                     if(!sdrefagg) {
@@ -845,6 +857,8 @@ static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *
                         }
                         if(dict->glyphs[nsyms_decoded]) sj_img_clear(dict->glyphs[nsyms_decoded],0);
                     }
+                } else {
+                    break;
                 }
                 nsyms_decoded++;
             }
