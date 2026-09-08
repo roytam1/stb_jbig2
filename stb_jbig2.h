@@ -646,17 +646,91 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
 
 /* --- Symbol dictionary (segment type 0) --- */
 static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
-    sj_sym_dict *dict; sj_u32 num_syms,i;
+    sj_sym_dict *dict; sj_u32 num_syms, num_new_syms, num_ex_syms, offset;
+    sj_u16 flags; int sdhuff, sdrefagg, sdtemplate, sdrtemplate;
+    int sdat_bytes; sj_u32 i;
     (void)ctx;
-    if(seg->data_len<14) return -1;
-    num_syms=sj_get32(sd+5)+sj_get32(sd+9);
+    if(seg->data_len<10) return -1;
+    flags=sj_get16(sd);
+    sdhuff=flags&1; sdrefagg=(flags>>1)&1;
+    sdtemplate=(flags>>10)&3; sdrtemplate=(flags>>12)&1;
+    sdat_bytes=sdhuff?0:(sdtemplate==0?8:2);
+    offset=2+(sj_u32)sdat_bytes;
+    if(sdrefagg&&!sdrtemplate) offset+=4;
+    if(offset+8>seg->data_len) return -1;
+    num_ex_syms=sj_get32(sd+offset);
+    num_new_syms=sj_get32(sd+offset+4);
+    offset+=8;
+    num_syms=num_ex_syms;
     dict=(sj_sym_dict*)calloc(1,sizeof(*dict)); if(!dict) return -1;
     dict->n_symbols=num_syms;
-    dict->glyphs=(stb_jbig2_image**)calloc(num_syms,sizeof(stb_jbig2_image*));
+    dict->glyphs=(stb_jbig2_image**)calloc(num_syms?num_syms:1,sizeof(stb_jbig2_image*));
     if(!dict->glyphs){free(dict);return -1;}
-    for(i=0;i<num_syms;i++) {
-        dict->glyphs[i]=sj_img_new(1,1);
-        if(dict->glyphs[i]) sj_img_clear(dict->glyphs[i],0);
+    if(sdhuff) {
+        for(i=0;i<num_new_syms;i++) {
+            dict->glyphs[i]=sj_img_new(1,1);
+            if(dict->glyphs[i]) sj_img_clear(dict->glyphs[i],0);
+        }
+    } else {
+        sj_arith *as; sj_cx *gb_stats, *gr_stats;
+        int gb_sz=sdtemplate==0?65536:sdtemplate==1?8192:1024;
+        int gr_sz=sdrtemplate?1024:8192;
+        sj_u32 nsyms_decoded=0, hc_height=0;
+        sj_u32 sym_width=0, tot_width=0;
+        sj_int_ctx *iadw, *iaex, *iaai;
+        sj_int_ctx *iadh;
+        gb_stats=(sj_cx*)calloc(gb_sz,sizeof(sj_cx));
+        gr_stats=(sj_cx*)calloc(gr_sz,sizeof(sj_cx));
+        if(!gb_stats||!gr_stats){free(gb_stats);free(gr_stats);free(dict->glyphs);free(dict);return -1;}
+        as=sj_arith_new(sd+offset,seg->data_len-offset);
+        if(!as){free(gb_stats);free(gr_stats);free(dict->glyphs);free(dict);return -1;}
+        iadh=sj_int_ctx_new(); iadw=sj_int_ctx_new();
+        iaex=sj_int_ctx_new(); iaai=sj_int_ctx_new();
+        hc_height=0; nsyms_decoded=0;
+        while(nsyms_decoded<num_new_syms) {
+            sj_i32 hcdh; sj_u32 dw;
+            { int rc=sj_int_decode(iadh,as,&hcdh); if(rc<0) goto sym_done; if(rc>0) goto sym_done; }
+            hc_height=(sj_u32)((sj_i32)hc_height+hcdh); sym_width=0; tot_width=0;
+            for(;;) {
+                sj_i32 idw;
+                { int rc=sj_int_decode(iadw,as,&idw); if(rc<0) goto sym_done; if(rc>0) break; }
+                dw=(sj_u32)idw; sym_width+=dw; tot_width+=sym_width;
+                if(nsyms_decoded<num_new_syms) {
+                    sj_i32 refagg_ninst=0;
+                    if(!sdrefagg) {
+                        sj_i8 gbat[8]={0}; int tpl=sdtemplate;
+                        stb_jbig2_image *glyph;
+                        sj_u32 stride;
+                        glyph=sj_img_new(sym_width,hc_height);
+                        if(!glyph) goto sym_done;
+                        stride=(sym_width+7)>>3;
+                        memset(glyph->data,0,(size_t)stride*hc_height);
+                        { int rc=sj_decode_gb(glyph,as,gb_stats,tpl,0,gbat); if(rc<0){sj_img_release(glyph);goto sym_done;} }
+                        dict->glyphs[nsyms_decoded]=glyph;
+                    } else {
+                        { int rc=sj_int_decode(iaai,as,&refagg_ninst); if(rc<0)goto sym_done; if(rc>0)goto sym_done; }
+                        if(refagg_ninst==1) {
+                            sj_i32 id,rdx,rdy;
+                            { int rc=sj_int_decode(iaai,as,&id); if(rc<0)goto sym_done; }
+                            { int rc=sj_int_decode(iadw,as,&rdx); if(rc<0)goto sym_done; }
+                            { int rc=sj_int_decode(iadw,as,&rdy); if(rc<0)goto sym_done; }
+                            if(id>=0 && (sj_u32)id<nsyms_decoded && dict->glyphs[id]) {
+                                stb_jbig2_image *glyph=sj_img_new(sym_width,hc_height);
+                                if(glyph) { sj_img_clear(glyph,0); sj_img_compose(glyph,dict->glyphs[id],(int)rdx,(int)rdy,SJ_COMPOSE_OR); dict->glyphs[nsyms_decoded]=glyph; }
+                            } else { dict->glyphs[nsyms_decoded]=sj_img_new(sym_width,hc_height); }
+                        } else {
+                            dict->glyphs[nsyms_decoded]=sj_img_new(sym_width,hc_height);
+                        }
+                        if(dict->glyphs[nsyms_decoded]) sj_img_clear(dict->glyphs[nsyms_decoded],0);
+                    }
+                }
+                nsyms_decoded++;
+            }
+        }
+sym_done:
+        sj_int_ctx_free(iadh); sj_int_ctx_free(iadw);
+        sj_int_ctx_free(iaex); sj_int_ctx_free(iaai);
+        free(as); free(gb_stats); free(gr_stats);
     }
     seg->result=dict;
     return 0;
@@ -755,6 +829,8 @@ static int sj_data_in(stb_jbig2_context *ctx, const sj_u8 *data, size_t size) {
 
     for (;;) {
         size_t avail=ctx->buf_wr-ctx->buf_rd;
+        /* Safety: if no progress, break */
+        if (avail == 0 && ctx->state != SJ_FILE_HDR && ctx->state != SJ_FILE_EOF) return 0;
         switch(ctx->state) {
         case SJ_FILE_HDR:
             if(avail<9) return 0;
