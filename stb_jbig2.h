@@ -599,28 +599,37 @@ static int sj_decode_imm_gen(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *s
     return 0;
 }
 
-/* --- Decode text region (simplified) --- */
+/* --- Decode text region --- */
 static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
     sj_u32 SBW,SBH,SBNUM,SBX,SBY;
-    int SBHUFF,comp_op;
+    int SBHUFF,SBREFINE,LOGSBSTRIPS,SBSTRIPS,REFCORNER,TRANSPOSED,SBCOMBOP,SBDEFPIXEL,SBDSOFFSET,SBRTEMPLATE;
     stb_jbig2_image *im;
     sj_u32 d_off;
-    if(seg->data_len<26) return -1;
+    if(seg->data_len<17) return -1;
     SBW=sj_get32(sd); SBH=sj_get32(sd+4); SBX=sj_get32(sd+8); SBY=sj_get32(sd+12);
-    SBHUFF=sd[16]&1;
-    SBNUM=sj_get32(sd+22);
-    comp_op=(sd[16]>>4)&7;
+    {
+        sj_u16 flags=sj_get16(sd+17);
+        SBHUFF=flags&1; SBREFINE=(flags>>1)&1;
+        LOGSBSTRIPS=(flags>>2)&3; SBSTRIPS=1<<LOGSBSTRIPS;
+        REFCORNER=(flags>>4)&3; TRANSPOSED=(flags>>6)&1;
+        SBCOMBOP=(flags>>7)&3; SBDEFPIXEL=(flags>>9)&1;
+        SBDSOFFSET=(flags>>10)&0x1f; if(SBDSOFFSET>0x1f) SBDSOFFSET-=0x20;
+        SBRTEMPLATE=(flags>>15)&1;
+    }
+    d_off=19;
+    if(SBREFINE&&!SBRTEMPLATE) d_off+=4;
+    if(d_off+4>seg->data_len) return -1;
+    SBNUM=sj_get32(sd+d_off); d_off+=4;
     im=sj_img_new(SBW,SBH); if(!im) return -1;
-    sj_img_clear(im,(sd[16]>>3)&1);
-    d_off=26;
-    if (SBHUFF && seg->data_len>d_off) {
-        sj_huff_state *hs=sj_huff_new(sd+d_off,seg->data_len-d_off);
+    sj_img_clear(im,(sj_u8)SBDEFPIXEL);
+    if(SBHUFF) {
+        /* Huffman path - simplified, just scan symbols */
         sj_u32 inst; sj_u32 curx=0;
-        if (!hs) { sj_img_release(im); return 0; }
+        sj_huff_state *hs=sj_huff_new(sd+d_off,seg->data_len-d_off);
+        if (!hs) { sj_img_release(im); return -1; }
         for(inst=0;inst<SBNUM;inst++) {
             int oob=0, sym=sj_huff_get(hs,0,&oob);
             if(oob) break;
-            /* Symbol lookup from referred-to segments */
             { int si;
               for(si=0;si<seg->ref_seg_count;si++) {
                 sj_seg *rs=sj_find_seg(ctx,seg->ref_segs[si]);
@@ -636,10 +645,109 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
             }
         }
         sj_huff_free(hs);
+    } else {
+        /* Arithmetic path (6.4) */
+        sj_arith *as;
+        sj_int_ctx *iadt,*iafs,*iads,*iait,*iari,*iardw,*iardh,*iardx,*iardy;
+        sj_iaid_ctx *iaid;
+        sj_u32 sbnusyms=0, ninstances=0;
+        sj_i32 stript, firsts, curs, curt, dt, dfs, ids;
+        sj_u32 index;
+        int iaidsz=0, sbratsz;
+        /* Count total symbols in referred dictionaries */
+        for(index=0;index<seg->ref_seg_count;index++) {
+            sj_seg *rs=sj_find_seg(ctx,seg->ref_segs[index]);
+            if(rs&&rs->result&&(rs->flags&63)==0) {
+                sj_sym_dict *d=rs->result;
+                sbnusyms+=d->n_symbols;
+            }
+        }
+        /* Compute IAID size */
+        { sj_u32 v=sbnusyms; iaidsz=0; while(v) { iaidsz++; v>>=1; } }
+        if(iaidsz<1) iaidsz=1;
+        sbratsz=SBREFINE&&!SBRTEMPLATE?4:0;
+        as=sj_arith_new(sd+d_off,seg->data_len-d_off);
+        if(!as){sj_img_release(im);return -1;}
+        iadt=sj_int_ctx_new(); iafs=sj_int_ctx_new();
+        iads=sj_int_ctx_new(); iait=sj_int_ctx_new();
+        iari=sj_int_ctx_new(); iaid=sj_iaid_new((sj_u8)iaidsz);
+        iardw=sj_int_ctx_new(); iardh=sj_int_ctx_new();
+        iardx=sj_int_ctx_new(); iardy=sj_int_ctx_new();
+        /* 6.4.5 (1): decode STRIPT */
+        { int rc=sj_int_decode(iadt,as,&stript); if(rc) goto text_done; }
+        stript*=-(sj_i32)SBSTRIPS;
+        firsts=0;
+        /* 6.4.5 (3) */
+        while(ninstances<SBNUM) {
+            sj_i32 id; int ri=0;
+            /* 6.4.5 (3b): decode DT */
+            { int rc=sj_int_decode(iadt,as,&dt); if(rc) break; }
+            dt*=(sj_i32)SBSTRIPS; stript+=dt;
+            /* first symbol in strip */
+            { int rc=sj_int_decode(iafs,as,&dfs); if(rc) break; }
+            firsts+=dfs; curs=firsts;
+            for(;;) {
+                sj_i32 curt_val;
+                int sid=-1;
+                /* decode IDS */
+                { int rc=sj_int_decode(iads,as,&ids); if(rc>0) break; if(rc<0) break; }
+                curs+=ids+SBDSOFFSET;
+                /* decode CURT */
+                if(SBSTRIPS==1) curt_val=0;
+                else { int rc=sj_int_decode(iait,as,&curt_val); if(rc) break; }
+                {
+                    sj_i32 t=stript+curt_val;
+                    sj_u32 x_pos,y_pos;
+                    sj_sym_dict *dict=NULL;
+                    sj_seg *rs=NULL;
+                    (void)t;
+                    /* decode symbol ID */
+                    { int rc=sj_iaid_decode(iaid,as,&id); if(rc) break; }
+                    /* decode refinement indicator */
+                    if(SBREFINE) { int rc=sj_int_decode(iari,as,&ri); if(rc) break; }
+                    /* look up glyph */
+                    { int si;
+                      for(si=0;si<seg->ref_seg_count;si++) {
+                        sj_seg *rss=sj_find_seg(ctx,seg->ref_segs[si]);
+                        if(rss&&rss->result&&(rss->flags&63)==0) {
+                          dict=rss->result; rs=rss; break;
+                        }
+                      }
+                    }
+                    (void)rs;
+                    if(dict&&(sj_u32)id<dict->n_symbols&&dict->glyphs[id]) {
+                        stb_jbig2_image *ib=dict->glyphs[id];
+                        if(ri) {
+                            /* Simplified refinement: skip refinement, use base glyph */
+                        }
+                        /* Position calculation */
+                        x_pos=(sj_u32)curs; y_pos=(sj_u32)(stript+curt_val);
+                        if(!TRANSPOSED) {
+                            switch(REFCORNER) {
+                                default: break;
+                            }
+                        }
+                        sj_img_compose(im,ib,(int)x_pos,(int)y_pos,(sj_compose_op)SBCOMBOP);
+                    }
+                    /* update CURS */
+                    if(dict&&(sj_u32)id<dict->n_symbols&&dict->glyphs[id]) {
+                        if(!TRANSPOSED&&REFCORNER<2) curs+=dict->glyphs[id]->width-1;
+                    }
+                }
+                ninstances++;
+            }
+        }
+text_done:
+        sj_int_ctx_free(iadt); sj_int_ctx_free(iafs);
+        sj_int_ctx_free(iads); sj_int_ctx_free(iait);
+        sj_int_ctx_free(iari); sj_iaid_free(iaid);
+        sj_int_ctx_free(iardw); sj_int_ctx_free(iardh);
+        sj_int_ctx_free(iardx); sj_int_ctx_free(iardy);
+        free(as);
     }
     seg->result=im;
     { sj_page *pg=&ctx->pages[ctx->cur_page];
-      if(pg->image) sj_img_compose(pg->image,im,(int)SBX,(int)SBY,(sj_compose_op)comp_op);
+      if(pg->image) sj_img_compose(pg->image,im,(int)SBX,(int)SBY,(sj_compose_op)SBCOMBOP);
     }
     return 0;
 }
@@ -701,6 +809,7 @@ static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *
                         sj_i8 gbat[8]={0}; int tpl=sdtemplate;
                         stb_jbig2_image *glyph;
                         sj_u32 stride;
+                        { int j; for(j=0;j<sdat_bytes&&j<8;j++) gbat[j]=(sj_i8)sd[2+j]; }
                         glyph=sj_img_new(sym_width,hc_height);
                         if(!glyph) goto sym_done;
                         stride=(sym_width+7)>>3;
