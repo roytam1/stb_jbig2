@@ -1,4 +1,5 @@
 #define STB_JBIG2_IMPLEMENTATION
+#define STB_JBIG2_DEBUG
 #include "stb_jbig2.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,9 +31,8 @@ int main(int argc, char **argv) {
     }
 
     while ((pimg = stb_jbig2_page_out(ctx)) != NULL) {
-        fprintf(stderr, "Page %d: %dx%d stride=%d\n", page_count,
-               stb_jbig2_image_width(pimg), stb_jbig2_image_height(pimg),
-               stb_jbig2_image_stride(pimg));
+        fprintf(stderr, "Page %d: %dx%d\n", page_count,
+               stb_jbig2_image_width(pimg), stb_jbig2_image_height(pimg));
         stb_jbig2_release_page(ctx, pimg);
         page_count++;
     }

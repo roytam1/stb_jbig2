@@ -690,11 +690,11 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                 sj_i32 curt_val;
                 int sid=-1;
                 /* decode IDS */
-                { int rc=sj_int_decode(iads,as,&ids); if(rc>0) break; if(rc<0) break; }
+                { int rc=sj_int_decode(iads,as,&ids); if(rc<0) goto text_done; if(rc>0) break; }
                 curs+=ids+SBDSOFFSET;
                 /* decode CURT */
                 if(SBSTRIPS==1) curt_val=0;
-                else { int rc=sj_int_decode(iait,as,&curt_val); if(rc) break; }
+                else { int rc=sj_int_decode(iait,as,&curt_val); if(rc<0) goto text_done; if(rc>0) goto text_done; }
                 {
                     sj_i32 t=stript+curt_val;
                     sj_u32 x_pos,y_pos;
@@ -702,9 +702,18 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                     sj_seg *rs=NULL;
                     (void)t;
                     /* decode symbol ID */
-                    { int rc=sj_iaid_decode(iaid,as,&id); if(rc) break; }
+                    { int rc=sj_iaid_decode(iaid,as,&id); if(rc) goto text_done; }
                     /* decode refinement indicator */
-                    if(SBREFINE) { int rc=sj_int_decode(iari,as,&ri); if(rc) break; }
+                    if(SBREFINE) { int rc=sj_int_decode(iari,as,&ri); if(rc) goto text_done; }
+                    /* decode refinement data even if unused (to sync arithmetic state) */
+                    if(ri) {
+                        sj_i32 rdw,rdh,rdx,rdy;
+                        { int rc=sj_int_decode(iardw,as,&rdw); if(rc) goto text_done; }
+                        { int rc=sj_int_decode(iardh,as,&rdh); if(rc) goto text_done; }
+                        { int rc=sj_int_decode(iardx,as,&rdx); if(rc) goto text_done; }
+                        { int rc=sj_int_decode(iardy,as,&rdy); if(rc) goto text_done; }
+                        (void)rdw;(void)rdh;(void)rdx;(void)rdy;
+                    }
                     /* look up glyph */
                     { int si;
                       for(si=0;si<seg->ref_seg_count;si++) {
