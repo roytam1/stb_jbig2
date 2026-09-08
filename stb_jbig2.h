@@ -594,10 +594,76 @@ static int sj_decode_imm_gen(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *s
     return 0;
 }
 
+/* --- Decode refinement region --- */
+/* Refinement region: generic region decode using a reference image for context.
+ * Output image is (ref_w+RDW) x (ref_h+RDH), initialized to zero.
+ * For each pixel, a 13-bit (template0) or 10-bit (template1) context is built
+ * from already-decoded output pixels and reference image pixels. */
+static stb_jbig2_image *sj_decode_refine_region(sj_arith *as,
+    stb_jbig2_image *ref, sj_i32 rdx, sj_i32 rdy, int tpl, sj_i8 grat[4])
+{
+    sj_u32 GRW, GRH, x, y;
+    stb_jbig2_image *im;
+    sj_cx *gr_stats;
+    int ctx_sz;
+    if (!ref) return NULL;
+    { sj_i32 w2 = (sj_i32)ref->width + rdx, h2 = (sj_i32)ref->height + rdy;
+      if (w2 <= 0 || h2 <= 0) return NULL;
+      GRW = (sj_u32)w2; GRH = (sj_u32)h2;
+    }
+    im = sj_img_new(GRW, GRH);
+    if (!im) return NULL;
+    ctx_sz = tpl ? (1 << 10) : (1 << 13);
+    gr_stats = (sj_cx *)calloc((size_t)ctx_sz, sizeof(sj_cx));
+    if (!gr_stats) { sj_img_release(im); return NULL; }
+    for (y = 0; y < GRH; y++) {
+        sj_u32 out = 0; int bits = 8; sj_u8 *d = &im->data[y * im->stride];
+        for (x = 0; x < GRW; x++) {
+            sj_u32 ctx_val = 0;
+            if (tpl == 0) {
+                ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x - 1, (int)y) << 0;
+                ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + 1, (int)y - 1) << 1;
+                ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + 0, (int)y - 1) << 2;
+                ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + grat[0], (int)y + grat[1]) << 3;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy + 1) << 4;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy + 1) << 5;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx - 1, (int)y - rdy + 1) << 6;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy + 0) << 7;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy + 0) << 8;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx - 1, (int)y - rdy + 0) << 9;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy - 1) << 10;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy - 1) << 11;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + grat[2], (int)y - rdy + grat[3]) << 12;
+            } else {
+                ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x - 1, (int)y) << 0;
+                ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + 1, (int)y - 1) << 1;
+                ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + 0, (int)y - 1) << 2;
+                ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x - 1, (int)y - 1) << 3;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy + 1) << 4;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy + 1) << 5;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy + 0) << 6;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy + 0) << 7;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx - 1, (int)y - rdy + 0) << 8;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy - 1) << 9;
+            }
+            { int bit = sj_arith_decode(as, &gr_stats[ctx_val]);
+              if (bit < 0) { free(gr_stats); sj_img_release(im); return NULL; }
+              out = (out << 1) | (sj_u32)bit; bits--;
+              *d = (sj_u8)(out << bits);
+              if (!bits) { bits = 8; d++; }
+            }
+        }
+        if (bits != 8) *d = (sj_u8)(out << bits);
+    }
+    free(gr_stats);
+    return im;
+}
+
 /* --- Decode text region --- */
 static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
     sj_u32 SBW,SBH,SBNUM,SBX,SBY;
     int SBHUFF,SBREFINE,LOGSBSTRIPS,SBSTRIPS,REFCORNER,TRANSPOSED,SBCOMBOP,SBDEFPIXEL,SBDSOFFSET,SBRTEMPLATE;
+    sj_i8 sbrat[4];
     stb_jbig2_image *im;
     sj_u32 d_off;
     if(seg->data_len<17) return -1;
@@ -612,7 +678,8 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
         SBRTEMPLATE=(flags>>15)&1;
     }
     d_off=19;
-    if(SBREFINE&&!SBRTEMPLATE) d_off+=4;
+    memset(sbrat, 0, sizeof(sbrat));
+    if(SBREFINE&&!SBRTEMPLATE) { sbrat[0]=(sj_i8)sd[d_off]; sbrat[1]=(sj_i8)sd[d_off+1]; sbrat[2]=(sj_i8)sd[d_off+2]; sbrat[3]=(sj_i8)sd[d_off+3]; d_off+=4; }
     if(d_off+4>seg->data_len) return -1;
     SBNUM=sj_get32(sd+d_off); d_off+=4;
     im=sj_img_new(SBW,SBH); if(!im) return -1;
@@ -701,19 +768,18 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                     sj_u32 x_pos,y_pos;
                     sj_sym_dict *dict=NULL;
                     sj_seg *rs=NULL;
+                    sj_i32 rdw=0,rdh=0,rdx=0,rdy=0;
                     (void)t;
                     /* decode symbol ID */
                     { int rc=sj_iaid_decode(iaid,as,&id); if(rc) goto text_done; }
                     /* decode refinement indicator */
                     if(SBREFINE) { int rc=sj_int_decode(iari,as,&ri); if(rc) goto text_done; }
-                    /* decode refinement data even if unused (to sync arithmetic state) */
+                    /* decode refinement data (to sync arithmetic state) */
                     if(ri) {
-                        sj_i32 rdw,rdh,rdx,rdy;
                         { int rc=sj_int_decode(iardw,as,&rdw); if(rc) goto text_done; }
                         { int rc=sj_int_decode(iardh,as,&rdh); if(rc) goto text_done; }
                         { int rc=sj_int_decode(iardx,as,&rdx); if(rc) goto text_done; }
                         { int rc=sj_int_decode(iardy,as,&rdy); if(rc) goto text_done; }
-                        (void)rdw;(void)rdh;(void)rdx;(void)rdy;
                     }
                     /* look up glyph in dictionaries */
                     { int si;
@@ -730,7 +796,16 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                     if(dict&&dict->glyphs[id]) {
                         stb_jbig2_image *ib=dict->glyphs[id];
                         if(ri) {
-                            /* Simplified refinement: skip refinement, use base glyph */
+                            /* Refine the base glyph: decode refinement region */
+                            sj_i32 refdx = (rdw >> 1) + rdx;
+                            sj_i32 refdy = (rdh >> 1) + rdy;
+                            stb_jbig2_image *refined = sj_decode_refine_region(as,
+                                ib, refdx, refdy, SBRTEMPLATE, sbrat);
+                            if (refined) {
+                                sj_img_release(ib);
+                                ib = refined;
+                                dict->glyphs[id] = refined;
+                            }
                         }
                     /* (3c.vi) CURS update before position calc */
                     if(!TRANSPOSED&&REFCORNER>1) curs+=(int)ib->width-1;
@@ -778,9 +853,6 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                         }
                     }
                         sj_img_compose(im,ib,(int)x_pos,(int)y_pos,(sj_compose_op)SBCOMBOP);
-                    if(ninstances<5) fprintf(stderr,"glyph %d: id=%d pos=(%d,%d) size=(%d,%d) stript=%d curt=%d curs=%d w=%d h=%d\n",
-                        ninstances,(int)id,(int)x_pos,(int)y_pos,(int)ib->width,(int)ib->height,
-                        (int)stript,(int)curt_val,(int)curs,(int)im->width,(int)im->height);
                     /* (3c.x) CURS update after compose */
                     if(!TRANSPOSED&&REFCORNER<2) curs+=(int)ib->width-1;
                     else if(TRANSPOSED&&(REFCORNER&1)) curs+=(int)ib->height-1;
