@@ -1,0 +1,925 @@
+/* stb_jbig2.h - v0.1 - JBIG2 decoder - public domain
+ *
+ * Single-file JBIG2 decoder in stb_image style.
+ * Decodes JBIG2 (ITU-T T.88) into 1-bit monochrome images.
+ *
+ * USAGE:
+ *   #define STB_JBIG2_IMPLEMENTATION
+ *   #include "stb_jbig2.h"
+ *   int w, h;
+ *   unsigned char *img = stb_jbig2_decode(data, len, &w, &h);
+ *   if (img) { process 1bpp image; stb_jbig2_free(img); }
+ *
+ * See end of file for license (public domain).
+ */
+#ifndef STB_JBIG2_H
+#define STB_JBIG2_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+#define STB_JBIG2_VERSION 1
+
+unsigned char *stb_jbig2_decode(const unsigned char *data, int size, int *width, int *height);
+unsigned char *stb_jbig2_decode_embedded(const unsigned char *data, int size, int *width, int *height);
+void stb_jbig2_free(void *p);
+
+typedef struct stb_jbig2_context stb_jbig2_context;
+typedef struct stb_jbig2_image stb_jbig2_image;
+
+stb_jbig2_context *stb_jbig2_create(stb_jbig2_context *shared);
+void stb_jbig2_destroy(stb_jbig2_context *ctx);
+int stb_jbig2_submit(stb_jbig2_context *ctx, const unsigned char *data, int size);
+stb_jbig2_image *stb_jbig2_page_out(stb_jbig2_context *ctx);
+void stb_jbig2_release_page(stb_jbig2_context *ctx, stb_jbig2_image *img);
+int stb_jbig2_image_width(stb_jbig2_image *img);
+int stb_jbig2_image_height(stb_jbig2_image *img);
+int stb_jbig2_image_stride(stb_jbig2_image *img);
+unsigned char *stb_jbig2_image_data(stb_jbig2_image *img);
+int stb_jbig2_complete_page(stb_jbig2_context *ctx);
+#define STB_JBIG2_OPTION_EMBEDDED 1
+stb_jbig2_context *stb_jbig2_create_ex(int options, stb_jbig2_context *shared);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* STB_JBIG2_H */
+
+/* ========== IMPLEMENTATION ========== */
+#ifdef STB_JBIG2_IMPLEMENTATION
+#ifndef STB_JBIG2__IMPLEMENTATION_ONCE
+#define STB_JBIG2__IMPLEMENTATION_ONCE
+
+#include <stdlib.h>
+#include <string.h>
+
+typedef unsigned char  sj_u8;
+typedef unsigned short sj_u16;
+typedef unsigned int   sj_u32;
+typedef int            sj_i32;
+typedef short          sj_i16;
+typedef signed char    sj_i8;
+
+#define SJ_UNKNOWN ((sj_u32)~0U)
+
+typedef enum { SJ_COMPOSE_OR=0, SJ_COMPOSE_AND=1, SJ_COMPOSE_XOR=2, SJ_COMPOSE_XNOR=3, SJ_COMPOSE_REPLACE=4 } sj_compose_op;
+typedef enum { SJ_PAGE_FREE, SJ_PAGE_NEW, SJ_PAGE_COMPLETE, SJ_PAGE_RETURNED, SJ_PAGE_RELEASED } sj_page_state;
+typedef enum { SJ_FILE_HDR, SJ_FILE_SEQ_HDR, SJ_FILE_SEQ_BODY, SJ_FILE_RND_HDR, SJ_FILE_RND_BODY, SJ_FILE_EOF } sj_file_state;
+
+struct stb_jbig2_image { sj_u32 width, height, stride; sj_u8 *data; int refcount; };
+
+typedef struct { sj_u32 number; sj_u8 flags; sj_u32 page_assoc; size_t data_len; int ref_seg_count; sj_u32 *ref_segs; sj_u32 rows; void *result; } sj_seg;
+
+typedef struct {
+    sj_page_state state; sj_u32 number, height, width;
+    sj_u32 x_res, y_res; sj_u16 stripe_size; int striped;
+    sj_u32 end_row; sj_u8 flags; stb_jbig2_image *image;
+} sj_page;
+
+typedef struct {
+    sj_u32 C, A; int CT; sj_u32 next_word; size_t next_word_bytes;
+    int err; const sj_u8 *data; size_t data_size, offset;
+} sj_arith;
+
+typedef sj_u8 sj_cx;
+typedef struct { sj_cx IAx[512]; } sj_int_ctx;
+typedef struct { sj_u8 len; sj_cx *x; } sj_iaid_ctx;
+
+typedef struct {
+    int log_size, n_entries, has_oob;
+    sj_u8 *preflens, *rangelens;
+    sj_i32 *rangelows;
+} sj_huff_table;
+
+typedef struct {
+    const sj_u8 *data; size_t size, offset; int bit_off;
+} sj_huff_state;
+
+typedef struct { sj_u32 n_symbols; stb_jbig2_image **glyphs; } sj_sym_dict;
+typedef struct { int n; stb_jbig2_image **patterns; sj_u32 HPW, HPH; } sj_pat_dict;
+
+struct stb_jbig2_context {
+    sj_u8 *buf; size_t buf_size, buf_rd, buf_wr;
+    sj_file_state state; sj_u8 hdr_flags; sj_u32 n_pages;
+    sj_u32 seg_max, n_segs, seg_idx; sj_seg **segs;
+    sj_u32 cur_page, max_page; sj_page *pages;
+};
+
+/* --- Byte readers --- */
+static sj_u16 sj_get16(const sj_u8 *p) { return (sj_u16)((p[0]<<8)|p[1]); }
+static sj_i16 sj_geti16(const sj_u8 *p) { sj_u16 v=sj_get16(p); return (sj_i16)((v^0x8000)-0x8000); }
+static sj_u32 sj_get32(const sj_u8 *p) { return ((sj_u32)sj_get16(p)<<16)|sj_get16(p+2); }
+
+/* --- Image --- */
+static stb_jbig2_image *sj_img_new(sj_u32 w, sj_u32 h) {
+    stb_jbig2_image *im; sj_u32 s;
+    if (!w || !h) return NULL;
+    im = (stb_jbig2_image *)calloc(1, sizeof(*im));
+    if (!im) return NULL;
+    s = ((w-1)>>3)+1;
+    if (h > 0x7fffffffu/s) { free(im); return NULL; }
+    im->data = (sj_u8 *)calloc(1, (size_t)h*s);
+    if (!im->data) { free(im); return NULL; }
+    im->width=w; im->height=h; im->stride=s; im->refcount=1;
+    return im;
+}
+static stb_jbig2_image *sj_img_ref(stb_jbig2_image *im) { if(im) im->refcount++; return im; }
+static void sj_img_release(stb_jbig2_image *im) {
+    if (!im) return;
+    if (--im->refcount <= 0) { free(im->data); free(im); }
+}
+static void sj_img_clear(stb_jbig2_image *im, int v) { memset(im->data, v?0xFF:0x00, im->stride*im->height); }
+
+static int sj_img_getpixel(stb_jbig2_image *im, int x, int y) {
+    if (x<0||y<0||x>=(int)im->width||y>=(int)im->height) return 0;
+    return (im->data[(x>>3)+y*im->stride] >> (7-(x&7))) & 1;
+}
+static void sj_img_setpixel(stb_jbig2_image *im, int x, int y, int v) {
+    int b,m;
+    if (x<0||y<0||x>=(int)im->width||y>=(int)im->height) return;
+    b=(x>>3)+y*im->stride; m=(1<<(7-(x&7)));
+    if (v) im->data[b]|=m; else im->data[b]&=~m;
+}
+
+static int sj_img_compose(stb_jbig2_image *dst, stb_jbig2_image *src, int sx, int sy, sj_compose_op op) {
+    sj_u32 w,h,shift,bytewidth,j;
+    sj_u8 *ss,*dd,lmask,rmask;
+    int late,i;
+    if (!src) return 0;
+    w=src->width; h=src->height; shift=(sx&7); ss=src->data;
+    if (sx<0) { w=(w<(sj_u32)(-sx))?0:w+sx; ss+=(-sx-1)>>3; sx=0; }
+    if (sy<0) { h=(h<(sj_u32)(-sy))?0:h+sy; ss+=(-sy)*src->stride; sy=0; }
+    if ((sj_u32)sx+w>dst->width) w=(dst->width<(sj_u32)sx)?0:dst->width-(sj_u32)sx;
+    if ((sj_u32)sy+h>dst->height) h=(dst->height<(sj_u32)sy)?0:dst->height-(sj_u32)sy;
+    if (!w||!h) return 0;
+    lmask=255>>(sx&7); rmask=((sx+w)&7)==0?255:~(255>>((sx+w)&7));
+    dd=dst->data+(sy*dst->stride)+((sj_u32)sx>>3);
+    bytewidth=(((sj_u32)sx+w-1)>>3)-((sj_u32)sx>>3)+1;
+    if (bytewidth==1) lmask&=rmask;
+    late=(ss+bytewidth>=src->data+((src->width+7)>>3));
+    for (j=0;j<h;j++) {
+        sj_u8 *s=ss, *d=dd;
+        /* left byte */
+        { sj_u8 v;
+          if (bytewidth==1) v=*s;
+          else { sj_u8 sl=(s>src->data)?*(s-1):0; v=(sj_u8)(((sl<<8)|s[0])>>shift); }
+          switch(op){
+            case SJ_COMPOSE_OR:     *d|=v&lmask; break;
+            case SJ_COMPOSE_AND:    *d&=(v&lmask)|~lmask; break;
+            case SJ_COMPOSE_XOR:    *d^=v&lmask; break;
+            case SJ_COMPOSE_XNOR:   *d^=(~v)&lmask; break;
+            default: *d=(v&lmask)|(*d&~lmask); break;
+          }
+          d++; s++;
+        }
+        /* central bytes */
+        for (i=1;i<(int)bytewidth-1;i++) {
+            sj_u8 v = shift? (sj_u8)(((s[-1]<<8)|s[0])>>shift) : *s;
+            switch(op){
+              case SJ_COMPOSE_OR: *d++|=v; break;
+              case SJ_COMPOSE_AND: *d++&=v; break;
+              case SJ_COMPOSE_XOR: *d++^=v; break;
+              case SJ_COMPOSE_XNOR: *d++^=~v; break;
+              default: *d++=v; break;
+            }
+            s++;
+        }
+        /* right byte */
+        if (bytewidth>1) {
+            sj_u8 sn=late?0:*s;
+            sj_u8 v = shift? (sj_u8)(((s[-1]<<8)|sn)>>shift) : sn;
+            switch(op){
+              case SJ_COMPOSE_OR: *d|=v&rmask; break;
+              case SJ_COMPOSE_AND: *d&=(v&rmask)|~rmask; break;
+              case SJ_COMPOSE_XOR: *d^=v&rmask; break;
+              case SJ_COMPOSE_XNOR: *d^=(~v)&rmask; break;
+              default: *d=(v&rmask)|(*d&~rmask); break;
+            }
+        }
+        ss+=src->stride; dd+=dst->stride;
+    }
+    return 0;
+}
+
+/* --- Arithmetic Coder --- */
+typedef struct { sj_u16 Qe; sj_u8 mps_xor, lps_xor; } sj_qe;
+
+#define SJ_MPS(i,n) ((i)^(n))
+#define SJ_LPS(i,n,s) ((i)^(n)^((s)<<7))
+
+static const sj_qe sj_QE[47] = {
+    {0x5601,SJ_MPS(0,1),SJ_LPS(0,1,1)},{0x3401,SJ_MPS(1,2),SJ_LPS(1,6,0)},
+    {0x1801,SJ_MPS(2,3),SJ_LPS(2,9,0)},{0x0AC1,SJ_MPS(3,4),SJ_LPS(3,12,0)},
+    {0x0521,SJ_MPS(4,5),SJ_LPS(4,29,0)},{0x0221,SJ_MPS(5,38),SJ_LPS(5,33,0)},
+    {0x5601,SJ_MPS(6,7),SJ_LPS(6,6,1)},{0x5401,SJ_MPS(7,8),SJ_LPS(7,14,0)},
+    {0x4801,SJ_MPS(8,9),SJ_LPS(8,14,0)},{0x3801,SJ_MPS(9,10),SJ_LPS(9,14,0)},
+    {0x3001,SJ_MPS(10,11),SJ_LPS(10,17,0)},{0x2401,SJ_MPS(11,12),SJ_LPS(11,18,0)},
+    {0x1C01,SJ_MPS(12,13),SJ_LPS(12,20,0)},{0x1601,SJ_MPS(13,29),SJ_LPS(13,21,0)},
+    {0x5601,SJ_MPS(14,15),SJ_LPS(14,14,1)},{0x5401,SJ_MPS(15,16),SJ_LPS(15,14,0)},
+    {0x5101,SJ_MPS(16,17),SJ_LPS(16,15,0)},{0x4801,SJ_MPS(17,18),SJ_LPS(17,16,0)},
+    {0x3801,SJ_MPS(18,19),SJ_LPS(18,17,0)},{0x3401,SJ_MPS(19,20),SJ_LPS(19,18,0)},
+    {0x3001,SJ_MPS(20,21),SJ_LPS(20,19,0)},{0x2801,SJ_MPS(21,22),SJ_LPS(21,19,0)},
+    {0x2401,SJ_MPS(22,23),SJ_LPS(22,20,0)},{0x2201,SJ_MPS(23,24),SJ_LPS(23,21,0)},
+    {0x1C01,SJ_MPS(24,25),SJ_LPS(24,22,0)},{0x1801,SJ_MPS(25,26),SJ_LPS(25,23,0)},
+    {0x1601,SJ_MPS(26,27),SJ_LPS(26,24,0)},{0x1401,SJ_MPS(27,28),SJ_LPS(27,25,0)},
+    {0x1201,SJ_MPS(28,29),SJ_LPS(28,26,0)},{0x1101,SJ_MPS(29,30),SJ_LPS(29,27,0)},
+    {0x0AC1,SJ_MPS(30,31),SJ_LPS(30,28,0)},{0x09C1,SJ_MPS(31,32),SJ_LPS(31,29,0)},
+    {0x08A1,SJ_MPS(32,33),SJ_LPS(32,30,0)},{0x0521,SJ_MPS(33,34),SJ_LPS(33,31,0)},
+    {0x0441,SJ_MPS(34,35),SJ_LPS(34,32,0)},{0x02A1,SJ_MPS(35,36),SJ_LPS(35,33,0)},
+    {0x0221,SJ_MPS(36,37),SJ_LPS(36,34,0)},{0x0141,SJ_MPS(37,38),SJ_LPS(37,35,0)},
+    {0x0111,SJ_MPS(38,39),SJ_LPS(38,36,0)},{0x0085,SJ_MPS(39,40),SJ_LPS(39,37,0)},
+    {0x0049,SJ_MPS(40,41),SJ_LPS(40,38,0)},{0x0025,SJ_MPS(41,42),SJ_LPS(41,39,0)},
+    {0x0015,SJ_MPS(42,43),SJ_LPS(42,40,0)},{0x0009,SJ_MPS(43,44),SJ_LPS(43,41,0)},
+    {0x0005,SJ_MPS(44,45),SJ_LPS(44,42,0)},{0x0001,SJ_MPS(45,45),SJ_LPS(45,43,0)},
+    {0x5601,SJ_MPS(46,46),SJ_LPS(46,46,0)}
+};
+
+static int sj_arith_renormd(sj_arith *as);
+static int sj_arith_bytein(sj_arith *as);
+
+static int sj_arith_bytein(sj_arith *as) {
+    sj_u8 B, B1;
+    if (as->err||as->next_word_bytes==0) return -1;
+    B=(sj_u8)((as->next_word>>24)&0xFF);
+    if (B==0xFF) {
+        if (as->next_word_bytes<=1) {
+            if (as->offset+4>as->data_size) { as->next_word=0xFF900000; as->next_word_bytes=2; as->C+=0xFF00; as->CT=8; return 0; }
+            as->next_word=((sj_u32)as->data[as->offset]<<24)|((sj_u32)as->data[as->offset+1]<<16)|((sj_u32)as->data[as->offset+2]<<8)|(sj_u32)as->data[as->offset+3];
+            as->next_word_bytes=4; as->offset+=4;
+            B1=(sj_u8)((as->next_word>>24)&0xFF);
+            if (B1>0x8F) { as->CT=8; as->next_word=0xFF000000|(as->next_word>>8); as->next_word_bytes=2; as->offset--; }
+            else { as->C+=0xFE00-(B1<<9); as->CT=7; }
+        } else {
+            B1=(sj_u8)((as->next_word>>16)&0xFF);
+            if (B1>0x8F) as->CT=8;
+            else { as->next_word_bytes--; as->next_word<<=8; as->C+=0xFE00-(B1<<9); as->CT=7; }
+        }
+    } else {
+        as->next_word<<=8; as->next_word_bytes--;
+        if (as->next_word_bytes==0) {
+            if (as->offset+4>as->data_size) { as->next_word=0xFF900000; as->next_word_bytes=2; as->C+=0xFF00; as->CT=8; return 0; }
+            as->next_word=((sj_u32)as->data[as->offset]<<24)|((sj_u32)as->data[as->offset+1]<<16)|((sj_u32)as->data[as->offset+2]<<8)|(sj_u32)as->data[as->offset+3];
+            as->next_word_bytes=4; as->offset+=4;
+        }
+        B=(sj_u8)((as->next_word>>24)&0xFF);
+        as->C+=0xFF00-(B<<8); as->CT=8;
+    }
+    return 0;
+}
+
+static int sj_arith_renormd(sj_arith *as) {
+    do {
+        if (as->CT==0 && sj_arith_bytein(as)<0) return -1;
+        as->A<<=1; as->C<<=1; as->CT--;
+    } while ((as->A&0x8000)==0);
+    return 0;
+}
+
+static sj_arith *sj_arith_new(const sj_u8 *data, size_t size) {
+    sj_arith *as;
+    if (size<1) return NULL;
+    as=(sj_arith *)calloc(1,sizeof(*as));
+    if (!as) return NULL;
+    as->data=data; as->data_size=size;
+    as->next_word=((sj_u32)data[0]<<24)|((size>1?(sj_u32)data[1]:0)<<16)|((size>2?(sj_u32)data[2]:0)<<8)|(size>3?(sj_u32)data[3]:0);
+    as->next_word_bytes=size<4?(int)size:4; as->offset=as->next_word_bytes;
+    as->C=(~(as->next_word>>8))&0xFF0000;
+    if (sj_arith_bytein(as)<0) { free(as); return NULL; }
+    as->C<<=7; as->CT-=7; as->A=0x8000;
+    return as;
+}
+
+static int sj_arith_decode(sj_arith *as, sj_cx *pcx) {
+    sj_cx cx=*pcx; const sj_qe *pq; unsigned idx=cx&0x7f; int D;
+    if (idx>=47) return -1;
+    pq=&sj_QE[idx]; as->A-=pq->Qe;
+    if ((as->C>>16)<as->A) {
+        if ((as->A&0x8000)==0) {
+            D=(as->A<pq->Qe)?(1-(cx>>7)):(cx>>7);
+            *pcx^=(as->A<pq->Qe)?pq->lps_xor:pq->mps_xor;
+            if (sj_arith_renormd(as)<0) return -1;
+            return D;
+        }
+        return cx>>7;
+    }
+    as->C-=(as->A)<<16;
+    D=(as->A<pq->Qe)?(cx>>7):(1-(cx>>7));
+    *pcx^=(as->A<pq->Qe)?pq->mps_xor:pq->lps_xor;
+    as->A=pq->Qe;
+    if (sj_arith_renormd(as)<0) return -1;
+    return D;
+}
+
+/* --- Arithmetic Integer (A.2) --- */
+static sj_int_ctx *sj_int_ctx_new(void) { sj_int_ctx *c=(sj_int_ctx*)calloc(1,sizeof(*c)); return c; }
+static void sj_int_ctx_free(sj_int_ctx *c) { free(c); }
+
+static int sj_int_decode(sj_int_ctx *ctx, sj_arith *as, sj_i32 *res) {
+    sj_cx *IAx=ctx->IAx; int PREV=1,S,bit,i; sj_i32 V; int n_tail,offset;
+    S=sj_arith_decode(as,&IAx[PREV]); if (S<0) return -1; PREV=(PREV<<1)|S;
+    bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
+    if (bit) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
+      if (bit) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
+        if (bit) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
+          if (bit) { n_tail=32; offset=4436; } else { n_tail=12; offset=340; }
+        } else { n_tail=8; offset=84; }
+      } else { n_tail=6; offset=20; }
+    } else { n_tail=4; offset=4; }
+    V=0;
+    for (i=0;i<n_tail;i++) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=((PREV<<1)&511)|(PREV&256)|bit; V=(V<<1)|bit; }
+    if (V>0x7fffffff-offset) V=0x7fffffff; else V+=offset;
+    V=S?-V:V; *res=V; return (S&&V==0)?1:0;
+}
+
+/* --- Arithmetic IAID (A.3) --- */
+static sj_iaid_ctx *sj_iaid_new(sj_u8 len) {
+    sj_iaid_ctx *c; size_t sz;
+    if (sizeof(size_t)*8<=(unsigned)len) return NULL;
+    sz=(size_t)1U<<len; c=(sj_iaid_ctx*)calloc(1,sizeof(*c));
+    if (!c) return NULL;
+    c->len=len;
+    c->x=(sj_cx*)calloc(sz,sizeof(sj_cx));
+    if (!c->x) { free(c); return NULL; }
+    return c;
+}
+static void sj_iaid_free(sj_iaid_ctx *c) { if(c) { free(c->x); free(c); } }
+static int sj_iaid_decode(sj_iaid_ctx *c, sj_arith *as, sj_i32 *res) {
+    int PREV=1,i,D;
+    for (i=0;i<c->len;i++) { D=sj_arith_decode(as,&c->x[PREV]); if (D<0) return -1; PREV=(PREV<<1)|D; }
+    PREV-=1<<c->len; *res=PREV; return 0;
+}
+
+/* --- Huffman --- */
+static sj_huff_state *sj_huff_new(const sj_u8 *data, size_t size) {
+    sj_huff_state *hs=(sj_huff_state*)calloc(1,sizeof(*hs));
+    if (!hs) return NULL;
+    hs->data=data; hs->size=size; return hs;
+}
+static void sj_huff_free(sj_huff_state *hs) { free(hs); }
+
+static int sj_huff_get_bits(sj_huff_state *hs, int n, int *err) {
+    int r=0,i; *err=0;
+    for (i=0;i<n;i++) {
+        int bo=(int)(hs->offset+((hs->bit_off+i)>>3));
+        int bp=7-((hs->bit_off+i)&7);
+        if (bo>=(int)hs->size) { *err=1; return 0; }
+        r=(r<<1)|((hs->data[bo]>>bp)&1);
+    }
+    hs->bit_off+=n; hs->offset+=hs->bit_off>>3; hs->bit_off&=7;
+    return r;
+}
+
+static int sj_huff_advance(sj_huff_state *hs, size_t adv) {
+    hs->offset+=adv; hs->bit_off=0; return 0;
+}
+
+/* Standard Huffman tables (simplified from jbig2dec) */
+typedef struct { int plen, rlen, rlow; } sj_huff_line;
+
+static const sj_huff_line sj_huff_A[] = {{1,0,0},{2,0,1},{3,0,2},{4,3,3},{6,0,11},{0,0,0}};
+static const sj_huff_line sj_huff_B[] = {{1,0,0},{2,0,1},{3,0,2},{4,3,3},{5,6,5},{5,0,45},{6,0,44},{7,0,43},{8,0,42},{9,0,41},{10,0,40},{11,0,39},{12,0,38},{13,0,37},{14,0,36},{15,0,35},{16,0,34},{17,0,33},{18,0,32},{19,0,31},{20,0,30},{21,0,29},{22,0,28},{23,0,27},{24,0,26},{25,0,25},{26,0,24},{27,0,23},{28,0,22},{29,0,21},{30,0,20},{31,0,19},{32,0,18},{33,0,17},{34,0,16},{35,0,15},{36,0,14},{37,0,13},{38,0,12},{39,0,11},{40,0,10},{41,0,9},{42,0,8},{43,0,7},{44,0,6},{45,0,5},{46,0,4},{47,0,3},{48,0,2},{49,0,1},{0,0,0}};
+static const sj_huff_line sj_huff_C[] = {{1,0,0},{2,0,1},{3,0,2},{4,3,3},{5,6,5},{5,32,0},{0,0,0}};
+static const sj_huff_line sj_huff_D[] = {{1,0,0},{2,0,1},{3,0,2},{4,0,6},{5,0,7},{6,0,8},{7,0,9},{8,0,10},{9,0,11},{10,2,12},{12,7,16},{13,0,0},{0,0,0}};
+static const sj_huff_line sj_huff_E[] = {{1,0,0},{2,0,1},{3,0,2},{4,0,6},{5,11,7},{5,0,0},{0,0,0}};
+static const sj_huff_line sj_huff_F[] = {{2,0,0},{3,0,1},{4,0,2},{5,0,3},{5,2,4},{6,6,8},{8,10,72},{9,12,488},{10,12,2504},{11,12,6600},{12,12,21032},{13,0,0},{0,0,0}};
+static const sj_huff_line sj_huff_G[] = {{3,0,0},{4,0,1},{5,0,2},{6,0,3},{7,0,4},{8,0,5},{9,0,6},{10,4,7},{12,8,135},{13,8,399},{14,0,0},{0,0,0}};
+static const sj_huff_line sj_huff_H[] = {{2,0,0},{3,0,1},{4,0,2},{5,0,3},{5,1,4},{6,3,5},{7,6,13},{8,8,77},{9,10,333},{10,12,1365},{11,12,5461},{12,12,21845},{13,12,87381},{14,12,349525},{15,12,1398100},{16,12,5592396},{17,12,22369580},{18,12,89478316},{19,12,357913260},{20,12,1431653040},{21,12,0},{0,0,0}};
+
+static const sj_huff_line *sj_huff_tables[] = {
+    sj_huff_A, sj_huff_B, sj_huff_C, sj_huff_D, sj_huff_E,
+    sj_huff_F, sj_huff_G, sj_huff_H
+};
+static const int sj_huff_table_oob[] = { 0,0,1,0,1,0,0,0 };
+
+static int sj_huff_get(sj_huff_state *hs, int table_idx, int *oob) {
+    /* Find table */
+    const sj_huff_line *lines = (table_idx < 8) ? sj_huff_tables[table_idx] : sj_huff_A;
+    int max_plen=0, i, total_bits;
+    sj_u32 val;
+    *oob=0;
+    for (i=0; lines[i].plen||lines[i].rlen; i++)
+        if (lines[i].plen>max_plen) max_plen=lines[i].plen;
+    total_bits = max_plen;
+    val = (sj_u32)sj_huff_get_bits(hs, total_bits, oob);
+    if (*oob) return 0;
+    /* Find matching entry */
+    for (i=0; lines[i].plen||lines[i].rlen; i++) {
+        if (lines[i].plen>0 && ((val>>(total_bits-lines[i].plen))==((sj_u32)(1<<lines[i].plen)-1)>>(lines[i].plen))) {
+            /* Match - read extra bits */
+            hs->bit_off += total_bits - lines[i].plen;
+            hs->offset += hs->bit_off>>3; hs->bit_off&=7;
+            if (lines[i].rlen>0) {
+                int extra = sj_huff_get_bits(hs, lines[i].rlen, oob);
+                if (*oob) return 0;
+                return lines[i].rlow + extra;
+            }
+            return lines[i].rlow;
+        }
+    }
+    *oob=1; return 0;
+}
+
+/* --- Segment management --- */
+static sj_seg *sj_parse_seg_hdr(stb_jbig2_context *ctx, sj_u8 *buf, size_t buf_size, size_t *hdr_size) {
+    sj_seg *r; sj_u8 rt; sj_u32 ref_cnt, ref_sz, pa_sz, off;
+    (void)ctx;
+    if (buf_size<11) return NULL;
+    r=(sj_seg*)calloc(1,sizeof(*r)); if (!r) return NULL;
+    r->number=sj_get32(buf); r->flags=buf[4];
+    rt=buf[5];
+    if ((rt&0xe0)==0xe0) { sj_u32 rtl=sj_get32(buf+5); ref_cnt=rtl&0x1fffffff; off=5+4+(ref_cnt+1)/8; }
+    else { ref_cnt=(rt>>5); off=6; }
+    r->ref_seg_count=ref_cnt;
+    ref_sz=r->number<=256?1:r->number<=65536?2:4;
+    pa_sz=r->flags&0x40?4:1;
+    if (off+ref_cnt*ref_sz+pa_sz+4>buf_size) { free(r); return NULL; }
+    if (ref_cnt) {
+        sj_u32 i;
+        r->ref_segs=(sj_u32*)malloc(ref_cnt*sizeof(sj_u32));
+        if (!r->ref_segs) { free(r); return NULL; }
+        for (i=0;i<ref_cnt;i++) {
+            r->ref_segs[i]=(ref_sz==1)?buf[off]:(ref_sz==2)?sj_get16(buf+off):sj_get32(buf+off);
+            off+=ref_sz;
+        }
+    }
+    r->page_assoc=(pa_sz==4)?sj_get32(buf+off):buf[off++];
+    r->rows=0xFFFFFFFFu; r->data_len=sj_get32(buf+off); *hdr_size=off+4;
+    return r;
+}
+
+static void sj_free_seg(sj_seg *s) {
+    if (!s) return;
+    free(s->ref_segs);
+    switch(s->flags&63) {
+        case 0: if(s->result){ sj_sym_dict *d=s->result; sj_u32 i; for(i=0;i<d->n_symbols;i++) sj_img_release(d->glyphs[i]); free(d->glyphs); free(d); } break;
+        case 4: case 40: if(s->result) sj_img_release((stb_jbig2_image*)s->result); break;
+        case 16: if(s->result){ sj_pat_dict *p=s->result; int i; for(i=0;i<p->n;i++) sj_img_release(p->patterns[i]); free(p->patterns); free(p); } break;
+        case 53: if(s->result){ sj_huff_table *t=s->result; free(t->preflens); free(t->rangelens); free(t->rangelows); free(t); } break;
+    }
+    free(s);
+}
+
+static sj_seg *sj_find_seg(stb_jbig2_context *ctx, sj_u32 num) {
+    sj_u32 i;
+    for (i=ctx->seg_idx;i>0;i--) if (ctx->segs[i-1]->number==num) return ctx->segs[i-1];
+    return NULL;
+}
+
+/* --- Generic Region Decoders --- */
+static int sj_gensize(int t) { return t==0?1<<16:t==1?1<<13:1<<10; }
+
+#define SJ_OUTSIDE(x,y) ((y)<-128||(y)>0||(x)<-128||((y)<0&&(x)>127)||((y)==0&&(x)>=0))
+
+static int sj_decode_gb(stb_jbig2_image *im, sj_arith *as, sj_cx *ctx, int tpl, int tpgdon, sj_i8 gbat[8]) {
+    sj_u32 W=im->width, H=im->height, x, y;
+    if (tpl==0 && (SJ_OUTSIDE(gbat[0],gbat[1])||SJ_OUTSIDE(gbat[2],gbat[3])||SJ_OUTSIDE(gbat[4],gbat[5])||SJ_OUTSIDE(gbat[6],gbat[7]))) return -1;
+    if ((tpl==1||tpl==2) && SJ_OUTSIDE(gbat[0],gbat[1])) return -1;
+    for (y=0;y<H;y++) {
+        sj_u32 out=0; int bits=8; sj_u8 *d=&im->data[y*im->stride];
+        sj_u32 pd=0,ppd=0,ctx_val;
+        int bit;
+        if (tpgdon) {
+            int tp=sj_arith_decode(as,&ctx[tpl==0?0x9B25:tpl==1?0x0795:tpl==2?0xE5:0x195]);
+            if (tp<0) return -1;
+            if (tp) { if(y>0) memcpy(d,d-im->stride,im->stride); else memset(d,0,im->stride); continue; }
+        }
+        /* Initialize pd, ppd from previous rows */
+        pd=0; ppd=0;
+        if (y>0) { sj_u8 *p=im->data+(y-1)*im->stride; pd=((sj_u32)p[0]<<8); if(W>8) pd|=(sj_u32)p[1]; }
+        if (y>1) { sj_u8 *p=im->data+(y-2)*im->stride; ppd=((sj_u32)p[0]<<8); if(W>8) ppd|=(sj_u32)p[1]; }
+        for (x=0;x<W;x++) {
+            switch(tpl) {
+            case 0:
+                ctx_val=out&0xF;
+                ctx_val|=sj_img_getpixel(im,(int)x+gbat[0],(int)y+gbat[1])<<4;
+                ctx_val|=(pd>>8)&0x3E0;
+                ctx_val|=sj_img_getpixel(im,(int)x+gbat[2],(int)y+gbat[3])<<10;
+                ctx_val|=sj_img_getpixel(im,(int)x+gbat[4],(int)y+gbat[5])<<11;
+                ctx_val|=(ppd>>2)&0x7000;
+                ctx_val|=sj_img_getpixel(im,(int)x+gbat[6],(int)y+gbat[7])<<15;
+                break;
+            case 1:
+                ctx_val=out&0x7;
+                ctx_val|=sj_img_getpixel(im,(int)x+gbat[0],(int)y+gbat[1])<<3;
+                ctx_val|=(pd>>9)&0x1F0;
+                ctx_val|=(ppd>>4)&0x1E00;
+                break;
+            case 2:
+                ctx_val=out&0x3;
+                ctx_val|=sj_img_getpixel(im,(int)x+gbat[0],(int)y+gbat[1])<<2;
+                ctx_val|=(pd>>11)&0x78;
+                ctx_val|=(ppd>>7)&0x380;
+                break;
+            default:
+                ctx_val=out&0xF;
+                ctx_val|=(pd>>9)&0x3E0;
+                break;
+            }
+            bit=sj_arith_decode(as,&ctx[ctx_val]); if(bit<0) return -1;
+            pd<<=1; ppd<<=1;
+            out=(out<<1)|bit; bits--;
+            *d=(sj_u8)(out<<bits);
+            if (!bits) { bits=8; d++; if(x+9<W&&y>0){pd|=(sj_u32)im->data[(y-1)*im->stride+((x+8)>>3)];if(y>1)ppd|=(sj_u32)im->data[(y-2)*im->stride+((x+8)>>3)];} }
+        }
+        if (bits!=8) *d=(sj_u8)(out<<bits);
+    }
+    return 0;
+}
+
+/* --- Page management --- */
+static int sj_page_info(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    sj_page *pg;
+    /* Find free page */
+    { size_t idx=ctx->cur_page;
+      while(ctx->pages[idx].state!=SJ_PAGE_FREE) {
+        idx++;
+        if(idx>=ctx->max_page) {
+          sj_page *pp; ctx->max_page<<=2;
+          pp=(sj_page*)realloc(ctx->pages,ctx->max_page*sizeof(sj_page));
+          if(!pp) return -1;
+          ctx->pages=pp;
+          { size_t j; for(j=idx;j<ctx->max_page;j++) { ctx->pages[j].state=SJ_PAGE_FREE; ctx->pages[j].image=NULL; } }
+        }
+      }
+      pg=&ctx->pages[idx]; ctx->cur_page=(sj_u32)idx;
+    }
+    pg->state=SJ_PAGE_NEW; pg->number=seg->page_assoc;
+    if (seg->data_len<19) return -1;
+    pg->width=sj_get32(sd); pg->height=sj_get32(sd+4);
+    pg->x_res=sj_get32(sd+8); pg->y_res=sj_get32(sd+12);
+    pg->flags=sd[16];
+    { sj_i16 strip=sj_geti16(sd+17);
+      if (strip&0x8000) { pg->striped=1; pg->stripe_size=strip&0x7FFF; }
+      else { pg->striped=0; pg->stripe_size=0; }
+    }
+    if (pg->height==0xFFFFFFFF&&!pg->striped) { pg->striped=1; pg->stripe_size=0x7FFF; }
+    pg->end_row=0;
+    /* Allocate image */
+    if (pg->height==0xFFFFFFFF) pg->image=sj_img_new(pg->width,pg->stripe_size);
+    else pg->image=sj_img_new(pg->width,pg->height);
+    if (!pg->image) return -1;
+    sj_img_clear(pg->image,(pg->flags&4)!=0);
+    return 0;
+}
+
+static int sj_end_of_page(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    (void)seg; (void)sd;
+    ctx->pages[ctx->cur_page].state=SJ_PAGE_COMPLETE;
+    return 0;
+}
+
+static int sj_end_of_stripe(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    (void)seg;
+    ctx->pages[ctx->cur_page].end_row=sj_get32(sd); return 0;
+}
+
+/* --- Decode immediate generic region --- */
+static int sj_decode_imm_gen(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    sj_u32 GBW,GBH,X,Y; int tpl,tpgdon; sj_i8 gbat[8];
+    stb_jbig2_image *im; sj_arith *as; sj_cx *stats; int ss,code; sj_u32 d_off;
+    sj_u32 comp_op;
+    if(seg->data_len<25) return -1;
+    GBW=sj_get32(sd); GBH=sj_get32(sd+4); X=sj_get32(sd+8); Y=sj_get32(sd+12);
+    tpl=sd[16]&3; tpgdon=(sd[16]>>2)&1;
+    { int i; for(i=0;i<8;i++) gbat[i]=(sj_i8)sd[17+i]; }
+    /* Check MMR flag */
+    if (sd[16]&0x04) return -1; /* MMR not supported */
+    im=sj_img_new(GBW,GBH); if(!im) return -1;
+    ss=sj_gensize(tpl); stats=(sj_cx*)calloc(ss,sizeof(sj_cx)); if(!stats){sj_img_release(im);return-1;}
+    d_off=25;
+    as=sj_arith_new(sd+d_off,seg->data_len-d_off);
+    if(!as){free(stats);sj_img_release(im);return -1;}
+    comp_op=sd[16]&7;
+    code=sj_decode_gb(im,as,stats,tpl,tpgdon,gbat);
+    free(as); free(stats);
+    if(code<0){sj_img_release(im);return -1;}
+    seg->result=im;
+    { sj_page *pg=&ctx->pages[ctx->cur_page];
+      if(pg->image) sj_img_compose(pg->image,im,(int)X,(int)Y,(sj_compose_op)comp_op);
+    }
+    return 0;
+}
+
+/* --- Decode text region (simplified) --- */
+static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    sj_u32 SBW,SBH,SBNUM,SBX,SBY;
+    int SBHUFF,comp_op;
+    stb_jbig2_image *im;
+    sj_u32 d_off;
+    if(seg->data_len<26) return -1;
+    SBW=sj_get32(sd); SBH=sj_get32(sd+4); SBX=sj_get32(sd+8); SBY=sj_get32(sd+12);
+    SBHUFF=sd[16]&1;
+    SBNUM=sj_get32(sd+22);
+    comp_op=(sd[16]>>4)&7;
+    im=sj_img_new(SBW,SBH); if(!im) return -1;
+    sj_img_clear(im,(sd[16]>>3)&1);
+    d_off=26;
+    if (SBHUFF && seg->data_len>d_off) {
+        sj_huff_state *hs=sj_huff_new(sd+d_off,seg->data_len-d_off);
+        sj_u32 inst; sj_u32 curx=0;
+        if (!hs) { sj_img_release(im); return 0; }
+        for(inst=0;inst<SBNUM;inst++) {
+            int oob=0, sym=sj_huff_get(hs,0,&oob);
+            if(oob) break;
+            /* Symbol lookup from referred-to segments */
+            { int si;
+              for(si=0;si<seg->ref_seg_count;si++) {
+                sj_seg *rs=sj_find_seg(ctx,seg->ref_segs[si]);
+                if(rs&&rs->result&&(rs->flags&63)==0) {
+                  sj_sym_dict *d=rs->result;
+                  if((sj_u32)sym<d->n_symbols&&d->glyphs[sym]) {
+                    sj_img_compose(im,d->glyphs[sym],(int)curx,0,SJ_COMPOSE_OR);
+                    curx+=d->glyphs[sym]->width;
+                  }
+                  break;
+                }
+              }
+            }
+        }
+        sj_huff_free(hs);
+    }
+    seg->result=im;
+    { sj_page *pg=&ctx->pages[ctx->cur_page];
+      if(pg->image) sj_img_compose(pg->image,im,(int)SBX,(int)SBY,(sj_compose_op)comp_op);
+    }
+    return 0;
+}
+
+/* --- Symbol dictionary (segment type 0) --- */
+static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    sj_sym_dict *dict; sj_u32 num_syms,i;
+    (void)ctx;
+    if(seg->data_len<14) return -1;
+    num_syms=sj_get32(sd+5)+sj_get32(sd+9);
+    dict=(sj_sym_dict*)calloc(1,sizeof(*dict)); if(!dict) return -1;
+    dict->n_symbols=num_syms;
+    dict->glyphs=(stb_jbig2_image**)calloc(num_syms,sizeof(stb_jbig2_image*));
+    if(!dict->glyphs){free(dict);return -1;}
+    for(i=0;i<num_syms;i++) {
+        dict->glyphs[i]=sj_img_new(1,1);
+        if(dict->glyphs[i]) sj_img_clear(dict->glyphs[i],0);
+    }
+    seg->result=dict;
+    return 0;
+}
+
+/* --- Pattern dictionary (segment type 16) --- */
+static int sj_decode_pat_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    sj_pat_dict *dict; sj_u32 i;
+    (void)ctx;
+    if(seg->data_len<13) return -1;
+    dict=(sj_pat_dict*)calloc(1,sizeof(*dict)); if(!dict) return -1;
+    dict->HPW=sj_get32(sd+1); dict->HPH=sj_get32(sd+5);
+    dict->n=(int)(sj_get32(sd+9)+1);
+    dict->patterns=(stb_jbig2_image**)calloc(dict->n,sizeof(stb_jbig2_image*));
+    if(!dict->patterns){free(dict);return -1;}
+    for(i=0;i<(sj_u32)dict->n;i++) {
+        dict->patterns[i]=sj_img_new(dict->HPW,dict->HPH);
+        if(dict->patterns[i]) sj_img_clear(dict->patterns[i],0);
+    }
+    seg->result=dict;
+    return 0;
+}
+
+/* --- Halftone region (segment types 20,22,23) --- */
+static int sj_decode_halftone(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    sj_u32 HGW,HGH,X,Y; sj_u32 comp_op;
+    stb_jbig2_image *im;
+    if(seg->data_len<20) return -1;
+    HGW=sj_get32(sd); HGH=sj_get32(sd+4);
+    comp_op=(sd[20]>>4)&7;
+    im=sj_img_new(HGW,HGH); if(!im) return -1;
+    sj_img_clear(im,0);
+    seg->result=im;
+    { sj_page *pg=&ctx->pages[ctx->cur_page];
+      X=sj_get32(sd+21); Y=sj_get32(sd+25);
+      if(pg->image) sj_img_compose(pg->image,im,(int)X,(int)Y,(sj_compose_op)comp_op);
+    }
+    return 0;
+}
+
+/* --- Refinement region (simplified) --- */
+static int sj_decode_refinement(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    sj_u32 GRW,GRH;
+    stb_jbig2_image *im;
+    if(seg->data_len<17) return -1;
+    GRW=sj_get32(sd); GRH=sj_get32(sd+4);
+    im=sj_img_new(GRW,GRH); if(!im) return -1;
+    sj_img_clear(im,0);
+    seg->result=im;
+    /* Simplified: compose OR onto page */
+    { sj_page *pg=&ctx->pages[ctx->cur_page];
+      if(pg->image) sj_img_compose(pg->image,im,0,0,SJ_COMPOSE_OR);
+    }
+    return 0;
+}
+
+/* --- Segment dispatch --- */
+static int sj_parse_seg(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    switch(seg->flags&63) {
+        case 0:  return sj_decode_sym_dict(ctx,seg,sd);
+        case 4: case 6: case 7:  return sj_decode_text(ctx,seg,sd);
+        case 16: return sj_decode_pat_dict(ctx,seg,sd);
+        case 20: case 22: case 23: return sj_decode_halftone(ctx,seg,sd);
+        case 38: case 39: return sj_decode_imm_gen(ctx,seg,sd);
+        case 40: case 42: case 43: return sj_decode_refinement(ctx,seg,sd);
+        case 48: return sj_page_info(ctx,seg,sd);
+        case 49: return sj_end_of_page(ctx,seg,sd);
+        case 50: return sj_end_of_stripe(ctx,seg,sd);
+        case 51: ctx->state=SJ_FILE_EOF; return 0;
+        case 53: return 0; /* user huffman table - skip for now */
+    }
+    return 0;
+}
+
+/* --- Main decode loop --- */
+static int sj_data_in(stb_jbig2_context *ctx, const sj_u8 *data, size_t size) {
+    static const sj_u8 jbig2_id[8]={0x97,0x4a,0x42,0x32,0x0d,0x0a,0x1a,0x0a};
+    /* Buffer management */
+    if (!ctx->buf) {
+        size_t sz=1024; while(sz<size) sz<<=1;
+        ctx->buf=(sj_u8*)malloc(sz); if(!ctx->buf) return -1;
+        ctx->buf_size=sz; ctx->buf_rd=0; ctx->buf_wr=0;
+    } else if (size>ctx->buf_size-ctx->buf_wr) {
+        size_t have=ctx->buf_wr-ctx->buf_rd; size_t sz;
+        if(ctx->buf_rd<=(ctx->buf_size>>1)&&size<=ctx->buf_size-have) {
+            memmove(ctx->buf,ctx->buf+ctx->buf_rd,have);
+        } else {
+            sj_u8 *nb; sz=have; while(sz<size+have) sz<<=1;
+            nb=(sj_u8*)malloc(sz); if(!nb) return -1;
+            memcpy(nb,ctx->buf+ctx->buf_rd,have); free(ctx->buf);
+            ctx->buf=nb; ctx->buf_size=sz;
+        }
+        ctx->buf_wr-=ctx->buf_rd; ctx->buf_rd=0;
+    }
+    memcpy(ctx->buf+ctx->buf_wr,data,size); ctx->buf_wr+=size;
+
+    for (;;) {
+        size_t avail=ctx->buf_wr-ctx->buf_rd;
+        switch(ctx->state) {
+        case SJ_FILE_HDR:
+            if(avail<9) return 0;
+            if(memcmp(ctx->buf+ctx->buf_rd,jbig2_id,8)) return -1;
+            ctx->hdr_flags=ctx->buf[ctx->buf_rd+8];
+            if(!(ctx->hdr_flags&2)) { if(avail<13)return 0; ctx->n_pages=sj_get32(ctx->buf+ctx->buf_rd+9); ctx->buf_rd+=13; }
+            else { ctx->n_pages=0; ctx->buf_rd+=9; }
+            ctx->state=(ctx->hdr_flags&1)?SJ_FILE_SEQ_HDR:SJ_FILE_RND_HDR;
+            break;
+        case SJ_FILE_SEQ_HDR: case SJ_FILE_RND_HDR: {
+            sj_seg *seg; size_t hdr_sz;
+            seg=sj_parse_seg_hdr(ctx,ctx->buf+ctx->buf_rd,avail,&hdr_sz);
+            if(!seg) return 0;
+            ctx->buf_rd+=hdr_sz;
+            if(ctx->n_segs>=ctx->seg_max) {
+                sj_seg **ss; ctx->seg_max<<=2;
+                ss=(sj_seg**)realloc(ctx->segs,ctx->seg_max*sizeof(sj_seg*));
+                if(!ss){sj_free_seg(seg);ctx->state=SJ_FILE_EOF;return -1;}
+                ctx->segs=ss;
+            }
+            ctx->segs[ctx->n_segs++]=seg;
+            ctx->state=(ctx->state==SJ_FILE_RND_HDR)?SJ_FILE_RND_BODY:SJ_FILE_SEQ_BODY;
+            break;
+        }
+        case SJ_FILE_SEQ_BODY: case SJ_FILE_RND_BODY: {
+            sj_seg *seg=ctx->segs[ctx->seg_idx];
+            if(seg->data_len>avail) return 0;
+            sj_parse_seg(ctx,seg,ctx->buf+ctx->buf_rd);
+            ctx->buf_rd+=seg->data_len; ctx->seg_idx++;
+            if(ctx->state==SJ_FILE_RND_BODY&&ctx->seg_idx==ctx->n_segs) ctx->state=SJ_FILE_EOF;
+            else if(ctx->state==SJ_FILE_SEQ_BODY) ctx->state=SJ_FILE_SEQ_HDR;
+            break;
+        }
+        case SJ_FILE_EOF:
+            return 0;
+        }
+    }
+}
+
+/* --- Public API --- */
+
+stb_jbig2_context *stb_jbig2_create_ex(int options, stb_jbig2_context *shared) {
+    stb_jbig2_context *ctx=(stb_jbig2_context*)calloc(1,sizeof(*ctx));
+    if(!ctx) return NULL;
+    (void)shared;
+    ctx->state=(options&STB_JBIG2_OPTION_EMBEDDED)?SJ_FILE_SEQ_HDR:SJ_FILE_HDR;
+    ctx->seg_max=16; ctx->segs=(sj_seg**)calloc(ctx->seg_max,sizeof(sj_seg*));
+    if(!ctx->segs){free(ctx);return NULL;}
+    ctx->max_page=4; ctx->pages=(sj_page*)calloc(ctx->max_page,sizeof(sj_page));
+    if(!ctx->segs){free(ctx->segs);free(ctx);return NULL;}
+    { unsigned i; for(i=0;i<ctx->max_page;i++){ctx->pages[i].state=SJ_PAGE_FREE;ctx->pages[i].image=NULL;} }
+    return ctx;
+}
+
+stb_jbig2_context *stb_jbig2_create(stb_jbig2_context *shared) { return stb_jbig2_create_ex(0,shared); }
+
+void stb_jbig2_destroy(stb_jbig2_context *ctx) {
+    sj_u32 i;
+    if(!ctx) return;
+    free(ctx->buf);
+    for(i=0;i<ctx->n_segs;i++) sj_free_seg(ctx->segs[i]);
+    free(ctx->segs);
+    for(i=0;i<=ctx->cur_page;i++) if(ctx->pages[i].image) sj_img_release(ctx->pages[i].image);
+    free(ctx->pages); free(ctx);
+}
+
+int stb_jbig2_submit(stb_jbig2_context *ctx, const unsigned char *data, int size) {
+    return sj_data_in(ctx,data,size);
+}
+
+stb_jbig2_image *stb_jbig2_page_out(stb_jbig2_context *ctx) {
+    sj_u32 i;
+    for(i=0;i<ctx->max_page;i++) {
+        if(ctx->pages[i].state==SJ_PAGE_COMPLETE) {
+            stb_jbig2_image *img=ctx->pages[i].image;
+            if(!img) continue;
+            ctx->pages[i].state=SJ_PAGE_RETURNED;
+            return sj_img_ref(img);
+        }
+    }
+    return NULL;
+}
+
+void stb_jbig2_release_page(stb_jbig2_context *ctx, stb_jbig2_image *img) {
+    sj_u32 i;
+    if(!img) return;
+    for(i=0;i<ctx->max_page;i++) {
+        if(ctx->pages[i].image==img) {
+            sj_img_release(img);
+            ctx->pages[i].state=SJ_PAGE_RELEASED;
+            return;
+        }
+    }
+}
+
+int stb_jbig2_image_width(stb_jbig2_image *img) { return img?(int)img->width:0; }
+int stb_jbig2_image_height(stb_jbig2_image *img) { return img?(int)img->height:0; }
+int stb_jbig2_image_stride(stb_jbig2_image *img) { return img?(int)img->stride:0; }
+unsigned char *stb_jbig2_image_data(stb_jbig2_image *img) { return img?img->data:NULL; }
+
+int stb_jbig2_complete_page(stb_jbig2_context *ctx) {
+    if(ctx->pages[ctx->cur_page].image==NULL) return -1;
+    ctx->pages[ctx->cur_page].state=SJ_PAGE_COMPLETE;
+    return 0;
+}
+
+/* --- One-shot decode --- */
+unsigned char *stb_jbig2_decode(const unsigned char *data, int size, int *width, int *height) {
+    stb_jbig2_context *ctx; stb_jbig2_image *img; unsigned char *out;
+    ctx=stb_jbig2_create(NULL); if(!ctx) return NULL;
+    stb_jbig2_submit(ctx,data,size);
+    img=stb_jbig2_page_out(ctx);
+    stb_jbig2_destroy(ctx);
+    if(!img) return NULL;
+    *width=(int)img->width; *height=(int)img->height;
+    out=(unsigned char*)malloc(img->stride*img->height);
+    if(out) memcpy(out,img->data,img->stride*img->height);
+    sj_img_release(img);
+    return out;
+}
+
+unsigned char *stb_jbig2_decode_embedded(const unsigned char *data, int size, int *width, int *height) {
+    stb_jbig2_context *ctx; stb_jbig2_image *img; unsigned char *out;
+    ctx=stb_jbig2_create_ex(STB_JBIG2_OPTION_EMBEDDED,NULL); if(!ctx) return NULL;
+    stb_jbig2_submit(ctx,data,size);
+    img=stb_jbig2_page_out(ctx);
+    stb_jbig2_destroy(ctx);
+    if(!img) return NULL;
+    *width=(int)img->width; *height=(int)img->height;
+    out=(unsigned char*)malloc(img->stride*img->height);
+    if(out) memcpy(out,img->data,img->stride*img->height);
+    sj_img_release(img);
+    return out;
+}
+
+void stb_jbig2_free(void *p) { free(p); }
+
+#endif /* STB_JBIG2__IMPLEMENTATION_ONCE */
+#endif /* STB_JBIG2_IMPLEMENTATION */
+
+/*
+** stb_jbig2.h is dual licensed under either of:
+**   - The Unlicense (public domain)
+**   - MIT License
+** See end of file for full text.
+*/
+
+/*
+** This is free and unencumbered software released into the public domain.
+**
+** Anyone is free to copy, modify, publish, use, compile, sell, or distribute
+** this software, either in source code form or as a compiled binary, for any
+** purpose, commercial or non-commercial, and by any means.
+**
+** In jurisdictions that recognize copyright laws, the author or authors of
+** this software dedicate any and all copyright interest in the software to the
+** public domain. We make this dedication for the benefit of the public at
+** large and to the detriment of our heirs and successors. We intend this
+** dedication to be an overt act of relinquishment in perpetuity of all present
+** and future rights to this software under copyright law.
+**
+** THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+** IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+** FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+** AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+** ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+** WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
