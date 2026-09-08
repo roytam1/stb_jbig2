@@ -151,7 +151,11 @@ static int sj_img_compose(stb_jbig2_image *dst, stb_jbig2_image *src, int sx, in
     dd=dst->data+(sy*dst->stride)+((sj_u32)sx>>3);
     bytewidth=(((sj_u32)sx+w-1)>>3)-((sj_u32)sx>>3)+1;
     if (bytewidth==1) lmask&=rmask;
-    late=(ss+bytewidth>=src->data+((src->width+7)>>3));
+    /* Reference uses ss=src-1 when sx>=0, making late=(bytewidth>stride).
+     * Our ss=src, so use > for sx>=0 case. */
+    { sj_u32 stride_end = (src->width+7)>>3;
+      late = (sx >= 0) ? (ss+bytewidth > src->data+stride_end)
+                       : (ss+bytewidth >= src->data+stride_end); }
     for (j=0;j<h;j++) {
         sj_u8 *s=ss, *d=dd;
         /* left byte */
