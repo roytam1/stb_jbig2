@@ -316,21 +316,21 @@ static sj_int_ctx *sj_int_ctx_new(void) { sj_int_ctx *c=(sj_int_ctx*)calloc(1,si
 static void sj_int_ctx_free(sj_int_ctx *c) { free(c); }
 
 static int sj_int_decode(sj_int_ctx *ctx, sj_arith *as, sj_i32 *res) {
-    sj_cx *IAx=ctx->IAx; int PREV=1,S,bit,i; sj_i32 V; int n_tail,offset;
+    sj_cx *IAx=ctx->IAx; int PREV=1,S,bit,i; sj_i32 V; int n_tail,off;
     S=sj_arith_decode(as,&IAx[PREV]); if (S<0) return -1; PREV=(PREV<<1)|S;
     bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
     if (bit) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
       if (bit) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
         if (bit) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
           if (bit) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=(PREV<<1)|bit;
-            if (bit) { n_tail=32; offset=4436; } else { n_tail=12; offset=340; }
-          } else { n_tail=8; offset=84; }
-        } else { n_tail=6; offset=20; }
-      } else { n_tail=4; offset=4; }
-    } else { n_tail=2; offset=0; }
+            if (bit) { n_tail=32; off=4436; } else { n_tail=12; off=340; }
+          } else { n_tail=8; off=84; }
+        } else { n_tail=6; off=20; }
+      } else { n_tail=4; off=4; }
+    } else { n_tail=2; off=0; }
     V=0;
     for (i=0;i<n_tail;i++) { bit=sj_arith_decode(as,&IAx[PREV]); if (bit<0) return -1; PREV=((PREV<<1)&511)|(PREV&256)|bit; V=(V<<1)|bit; }
-    if (V>0x7fffffff-offset) V=0x7fffffff; else V+=offset;
+    if (V>0x7fffffff-off) V=0x7fffffff; else V+=off;
     V=S?-V:V; *res=V; return (S&&V==0)?1:0;
 }
 
@@ -445,7 +445,8 @@ static sj_seg *sj_parse_seg_hdr(stb_jbig2_context *ctx, sj_u8 *buf, size_t buf_s
             off+=ref_sz;
         }
     }
-    r->page_assoc=(pa_sz==4)?sj_get32(buf+off):buf[off++];
+    r->page_assoc=(pa_sz==4)?sj_get32(buf+off):buf[off];
+    off+=pa_sz;
     r->rows=0xFFFFFFFFu; r->data_len=sj_get32(buf+off); *hdr_size=off+4;
     return r;
 }
@@ -567,6 +568,7 @@ static int sj_page_info(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
 
 static int sj_end_of_page(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
     (void)seg; (void)sd;
+    fprintf(stderr,"  sj_end_of_page: cur_page=%d setting COMPLETE\n", ctx->cur_page);
     ctx->pages[ctx->cur_page].state=SJ_PAGE_COMPLETE;
     return 0;
 }
@@ -682,7 +684,6 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
         { int rc=sj_int_decode(iadt,as,&stript); if(rc) goto text_done; }
         stript*=-(sj_i32)SBSTRIPS;
             firsts=0;
-            (void)stript;
             /* 6.4.5 (3) */
             while(ninstances<SBNUM) {
                 sj_i32 id; int ri=0; int first_symbol=1;
@@ -690,7 +691,6 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                 /* 6.4.5 (3b): decode DT */
                 { int rc=sj_int_decode(iadt,as,&dt); if(rc) break; }
                 dt*=(sj_i32)SBSTRIPS; stript+=dt;
-                if(ninstances==0) fprintf(stderr,"TEXT: dt=%d SBSTRIPS=%d SBNUM=%u\n",(int)dt,SBSTRIPS,SBNUM);
                 for(;;) {
                     sj_i32 curt_val;
                     int sid=-1;
@@ -700,10 +700,11 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                         firsts+=dfs; curs=firsts;
                         first_symbol=0;
                     } else {
+                        /* (3c.ii guard): check instance count before decoding IDS */
+                        if(ninstances>SBNUM) break;
                         /* 6.4.8: decode IDS */
                         { int rc=sj_int_decode(iads,as,&ids); if(rc<0) goto text_done; if(rc>0) break; }
                         curs+=ids+SBDSOFFSET;
-                        if(ninstances>=SBNUM) break;
                     }
                 /* decode CURT */
                 if(SBSTRIPS==1) curt_val=0;
@@ -727,18 +728,19 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                         { int rc=sj_int_decode(iardy,as,&rdy); if(rc) goto text_done; }
                         (void)rdw;(void)rdh;(void)rdx;(void)rdy;
                     }
-                    /* look up glyph */
+                    /* look up glyph in dictionaries */
                     { int si;
                       for(si=0;si<seg->ref_seg_count;si++) {
                         sj_seg *rss=sj_find_seg(ctx,seg->ref_segs[si]);
                         if(rss&&rss->result&&(rss->flags&63)==0) {
-                          dict=rss->result; rs=rss; break;
+                          sj_sym_dict *d=rss->result;
+                          if((sj_u32)id<d->n_symbols) { dict=d; rs=rss; break; }
+                          id-=(sj_i32)d->n_symbols;
                         }
                       }
                     }
                     (void)rs;
-                    if(ninstances<3) fprintf(stderr,"TEXT: id=%d dict_n=%u glyph=%p\n",(int)id,dict?(unsigned)dict->n_symbols:0,(void*)(dict&&id>=0&&(sj_u32)id<dict->n_symbols?dict->glyphs[id]:NULL));
-                    if(dict&&(sj_u32)id<dict->n_symbols&&dict->glyphs[id]) {
+                    if(dict&&dict->glyphs[id]) {
                         stb_jbig2_image *ib=dict->glyphs[id];
                         if(ri) {
                             /* Simplified refinement: skip refinement, use base glyph */
@@ -792,10 +794,9 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                     if(!TRANSPOSED&&REFCORNER<2) curs+=(int)ib->width-1;
                     else if(TRANSPOSED&&(REFCORNER&1)) curs+=(int)ib->height-1;
                     }
+                    /* (3c.xi) NINSTANCES++ — per reference, inside for(;;) */
+                    ninstances++;
                 }
-                ninstances++;
-                if(ninstances<=3) fprintf(stderr,"TEXT: ninstances=%u composed=1\n",ninstances);
-                (void)ninstances;
             }
         }
 text_done:
@@ -831,7 +832,6 @@ static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *
     num_new_syms=sj_get32(sd+offset+4);
     offset+=8;
     num_syms=num_ex_syms;
-    fprintf(stderr,"SYMDICT: num_ex=%u num_new=%u\n",num_ex_syms,num_new_syms);
     dict=(sj_sym_dict*)calloc(1,sizeof(*dict)); if(!dict) return -1;
     dict->n_symbols=num_syms;
     dict->glyphs=(stb_jbig2_image**)calloc(num_syms?num_syms:1,sizeof(stb_jbig2_image*));
@@ -853,9 +853,6 @@ static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *
         gr_stats=(sj_cx*)calloc(gr_sz,sizeof(sj_cx));
         if(!gb_stats||!gr_stats){free(gb_stats);free(gr_stats);free(dict->glyphs);free(dict);return -1;}
         as=sj_arith_new(sd+offset,seg->data_len-offset);
-        { int k; fprintf(stderr,"SYMDICT: arith data (%u bytes): ",(unsigned)(seg->data_len-offset));
-          for(k=0;k<16&&(unsigned)k<seg->data_len-offset;k++) fprintf(stderr,"%02x ",sd[offset+k]);
-          fprintf(stderr,"\n"); fflush(stderr); }
         if(!as){free(gb_stats);free(gr_stats);free(dict->glyphs);free(dict);return -1;}
         iadh=sj_int_ctx_new(); iadw=sj_int_ctx_new();
         iaex=sj_int_ctx_new(); iaai=sj_int_ctx_new();
@@ -863,16 +860,14 @@ static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *
         while(nsyms_decoded<num_new_syms) {
             sj_i32 hcdh; sj_u32 dw;
             { int rc=sj_int_decode(iadh,as,&hcdh);
-      fprintf(stderr,"SYMDICT: IADH nsym=%u rc=%d hcdh=%d\n",nsyms_decoded,rc,(int)hcdh); fflush(stderr);
-      if(rc<0){fprintf(stderr,"SYMDICT: IADH failed\n");fflush(stderr);goto sym_done;}
-      if(rc>0){fprintf(stderr,"SYMDICT: IADH OOB\n");fflush(stderr);goto sym_done;}
-    }            hc_height=(sj_u32)((sj_i32)hc_height+hcdh); sym_width=0; tot_width=0;
+              if(rc<0) goto sym_done;
+              if(rc>0) goto sym_done;
+            }            hc_height=(sj_u32)((sj_i32)hc_height+hcdh); sym_width=0; tot_width=0;
             for(;;) {
                 sj_i32 idw;
                 { int rc=sj_int_decode(iadw,as,&idw);
-                  if(rc<0){fprintf(stderr,"SYMDICT: IADW fail nsym=%u pos=%d rc=%d\n",nsyms_decoded,(int)as->offset,rc);fflush(stderr);goto sym_done;}
-                  if(rc>0) { fprintf(stderr,"SYMDICT: IADW OOB nsym=%u pos=%d\n",nsyms_decoded,(int)as->offset); fflush(stderr); break; }
-                  fprintf(stderr,"SYMDICT: IADW nsym=%u idw=%d A=%x C=%x CT=%d pos=%d\n",nsyms_decoded,(int)idw,as->A,as->C,as->CT,(int)as->offset); fflush(stderr);
+                  if(rc<0) goto sym_done;
+                  if(rc>0) break;
                 }
                 dw=(sj_u32)idw; sym_width+=dw; tot_width+=sym_width;
                 if(nsyms_decoded<num_new_syms) {
@@ -883,15 +878,13 @@ static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *
                         sj_u32 stride;
                         { int j; for(j=0;j<sdat_bytes&&j<8;j++) gbat[j]=(sj_i8)sd[2+j]; }
                         glyph=sj_img_new(sym_width,hc_height);
-                        if(!glyph){fprintf(stderr,"SYMDICT: glyph alloc fail w=%u h=%u\n",sym_width,hc_height);fflush(stderr);goto sym_done;}
+                        if(!glyph) goto sym_done;
                         stride=(sym_width+7)>>3;
                         memset(glyph->data,0,(size_t)stride*hc_height);
-                        { int rc=sj_decode_gb(glyph,as,gb_stats,tpl,0,gbat); if(rc<0){fprintf(stderr,"SYMDICT: gb failed at nsym=%u rc=%d\n",nsyms_decoded,rc);fflush(stderr);sj_img_release(glyph);goto sym_done;}
-                        fprintf(stderr,"SYMDICT: gb ok A=%x C=%x CT=%d pos=%d\n",as->A,as->C,as->CT,(int)as->offset); fflush(stderr); }
+                        { int rc=sj_decode_gb(glyph,as,gb_stats,tpl,0,gbat); if(rc<0){sj_img_release(glyph);goto sym_done;} }
                         dict->glyphs[nsyms_decoded]=glyph;
-                        if(nsyms_decoded<5) fprintf(stderr,"SYMDICT: sym %u: %ux%u glyph=%p pos=%d/%d A=%x C=%x CT=%d\n",nsyms_decoded,sym_width,hc_height,(void*)glyph,(int)as->offset,(int)as->data_size,as->A,as->C,as->CT);
                     } else {
-                        { int rc=sj_int_decode(iaai,as,&refagg_ninst); if(rc<0){fprintf(stderr,"SYMDICT: IAAI failed\n");goto sym_done;} if(rc>0){fprintf(stderr,"SYMDICT: IAAI OOB\n");goto sym_done;} }
+                        { int rc=sj_int_decode(iaai,as,&refagg_ninst); if(rc<0) goto sym_done; if(rc>0) goto sym_done; }
                         if(refagg_ninst==1) {
                             sj_i32 id,rdx,rdy;
                             { int rc=sj_int_decode(iaai,as,&id); if(rc<0)goto sym_done; }
@@ -913,7 +906,6 @@ static int sj_decode_sym_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *
             }
         }
 sym_done:
-        fprintf(stderr,"SYMDICT: done nsyms_decoded=%u finalpos=%d/%d\n",nsyms_decoded,(int)as->offset,(int)as->data_size);
         (void)nsyms_decoded;
         sj_int_ctx_free(iadh); sj_int_ctx_free(iadw);
         sj_int_ctx_free(iaex); sj_int_ctx_free(iaai);
@@ -976,6 +968,9 @@ static int sj_decode_refinement(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8
 
 /* --- Segment dispatch --- */
 static int sj_parse_seg(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
+    fprintf(stderr,"  sj_parse_seg: seg_num=%d flags=0x%02x type=%d data_len=%d cur_page=%d page_state=%d\n",
+        seg->number, seg->flags, seg->flags&63, (int)seg->data_len, ctx->cur_page,
+        ctx->cur_page<ctx->max_page ? ctx->pages[ctx->cur_page].state : -1);
     switch(seg->flags&63) {
         case 0:  return sj_decode_sym_dict(ctx,seg,sd);
         case 4: case 6: case 7:  return sj_decode_text(ctx,seg,sd);
@@ -1030,7 +1025,13 @@ static int sj_data_in(stb_jbig2_context *ctx, const sj_u8 *data, size_t size) {
         case SJ_FILE_SEQ_HDR: case SJ_FILE_RND_HDR: {
             sj_seg *seg; size_t hdr_sz;
             seg=sj_parse_seg_hdr(ctx,ctx->buf+ctx->buf_rd,avail,&hdr_sz);
-            if(!seg) return 0;
+            if(!seg) {
+                if(ctx->state==SJ_FILE_RND_HDR && ctx->n_segs>0) {
+                    ctx->state=SJ_FILE_RND_BODY;
+                    break;
+                }
+                return 0;
+            }
             ctx->buf_rd+=hdr_sz;
             if(ctx->n_segs>=ctx->seg_max) {
                 sj_seg **ss; ctx->seg_max<<=2;
@@ -1039,7 +1040,11 @@ static int sj_data_in(stb_jbig2_context *ctx, const sj_u8 *data, size_t size) {
                 ctx->segs=ss;
             }
             ctx->segs[ctx->n_segs++]=seg;
-            ctx->state=(ctx->state==SJ_FILE_RND_HDR)?SJ_FILE_RND_BODY:SJ_FILE_SEQ_BODY;
+            if(ctx->state==SJ_FILE_RND_HDR) {
+                if((seg->flags&63)==51) ctx->state=SJ_FILE_RND_BODY;
+            } else {
+                ctx->state=SJ_FILE_SEQ_BODY;
+            }
             break;
         }
         case SJ_FILE_SEQ_BODY: case SJ_FILE_RND_BODY: {
