@@ -52,7 +52,6 @@ stb_jbig2_context *stb_jbig2_create_ex(int options, stb_jbig2_context *shared);
 
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 typedef unsigned char  sj_u8;
 typedef unsigned short sj_u16;
@@ -151,8 +150,6 @@ static int sj_img_compose(stb_jbig2_image *dst, stb_jbig2_image *src, int sx, in
     dd=dst->data+(sy*dst->stride)+((sj_u32)sx>>3);
     bytewidth=(((sj_u32)sx+w-1)>>3)-((sj_u32)sx>>3)+1;
     if (bytewidth==1) lmask&=rmask;
-    /* Reference uses ss=src-1 when sx>=0, making late=(bytewidth>stride).
-     * Our ss=src, so use > for sx>=0 case. */
     { sj_u32 stride_end = (src->width+7)>>3;
       late = (sx >= 0) ? (ss+bytewidth > src->data+stride_end)
                        : (ss+bytewidth >= src->data+stride_end); }
@@ -604,14 +601,14 @@ static int sj_decode_imm_gen(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *s
  * For each pixel, a 13-bit (template0) or 10-bit (template1) context is built
  * from already-decoded output pixels and reference image pixels. */
 static stb_jbig2_image *sj_decode_refine_region(sj_arith *as,
-    stb_jbig2_image *ref, sj_i32 rdx, sj_i32 rdy, int tpl, sj_i8 grat[4])
+    stb_jbig2_image *ref, sj_i32 rdw, sj_i32 rdh, sj_i32 refdx, sj_i32 refdy, int tpl, sj_i8 grat[4])
 {
     sj_u32 GRW, GRH, x, y;
     stb_jbig2_image *im;
     sj_cx *gr_stats;
     int ctx_sz;
     if (!ref) return NULL;
-    { sj_i32 w2 = (sj_i32)ref->width + rdx, h2 = (sj_i32)ref->height + rdy;
+    { sj_i32 w2 = (sj_i32)ref->width + rdw, h2 = (sj_i32)ref->height + rdh;
       if (w2 <= 0 || h2 <= 0) return NULL;
       GRW = (sj_u32)w2; GRH = (sj_u32)h2;
     }
@@ -629,26 +626,26 @@ static stb_jbig2_image *sj_decode_refine_region(sj_arith *as,
                 ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + 1, (int)y - 1) << 1;
                 ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + 0, (int)y - 1) << 2;
                 ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + grat[0], (int)y + grat[1]) << 3;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy + 1) << 4;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy + 1) << 5;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx - 1, (int)y - rdy + 1) << 6;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy + 0) << 7;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy + 0) << 8;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx - 1, (int)y - rdy + 0) << 9;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy - 1) << 10;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy - 1) << 11;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + grat[2], (int)y - rdy + grat[3]) << 12;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 1, (int)y - refdy + 1) << 4;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 0, (int)y - refdy + 1) << 5;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx - 1, (int)y - refdy + 1) << 6;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 1, (int)y - refdy + 0) << 7;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 0, (int)y - refdy + 0) << 8;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx - 1, (int)y - refdy + 0) << 9;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 1, (int)y - refdy - 1) << 10;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 0, (int)y - refdy - 1) << 11;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + grat[2], (int)y - refdy + grat[3]) << 12;
             } else {
                 ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x - 1, (int)y) << 0;
                 ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + 1, (int)y - 1) << 1;
                 ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x + 0, (int)y - 1) << 2;
                 ctx_val |= (sj_u32)sj_img_getpixel(im, (int)x - 1, (int)y - 1) << 3;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy + 1) << 4;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy + 1) << 5;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 1, (int)y - rdy + 0) << 6;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy + 0) << 7;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx - 1, (int)y - rdy + 0) << 8;
-                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - rdx + 0, (int)y - rdy - 1) << 9;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 1, (int)y - refdy + 1) << 4;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 0, (int)y - refdy + 1) << 5;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 1, (int)y - refdy + 0) << 6;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 0, (int)y - refdy + 0) << 7;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx - 1, (int)y - refdy + 0) << 8;
+                ctx_val |= (sj_u32)sj_img_getpixel(ref, (int)x - refdx + 0, (int)y - refdy - 1) << 9;
             }
             { int bit = sj_arith_decode(as, &gr_stats[ctx_val]);
               if (bit < 0) { free(gr_stats); sj_img_release(im); return NULL; }
@@ -728,8 +725,8 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                 sbnusyms+=d->n_symbols;
             }
         }
-        /* Compute IAID size */
-        { sj_u32 v=sbnusyms; iaidsz=0; while(v) { iaidsz++; v>>=1; } }
+        /* Compute IAID size: ceil(log2(SBNUMSYMS)) = smallest k where 2^k >= SBNUMSYMS */
+        { iaidsz=0; while(((sj_u32)1u<<iaidsz)<sbnusyms) iaidsz++; }
         if(iaidsz<1) iaidsz=1;
         as=sj_arith_new(sd+d_off,seg->data_len-d_off);
         if(!as){sj_img_release(im);return -1;}
@@ -766,7 +763,7 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                     }
                 /* decode CURT */
                 if(SBSTRIPS==1) curt_val=0;
-                else { int rc=sj_int_decode(iait,as,&curt_val); if(rc<0) goto text_done; if(rc>0) goto text_done; }
+                else { int rc=sj_int_decode(iait,as,&curt_val); if(rc) goto text_done; }
                 {
                     sj_i32 t=stript+curt_val;
                     sj_u32 x_pos,y_pos;
@@ -804,11 +801,9 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                             sj_i32 refdx = (rdw >> 1) + rdx;
                             sj_i32 refdy = (rdh >> 1) + rdy;
                             stb_jbig2_image *refined = sj_decode_refine_region(as,
-                                ib, refdx, refdy, SBRTEMPLATE, sbrat);
+                                ib, rdw, rdh, refdx, refdy, SBRTEMPLATE, sbrat);
                             if (refined) {
-                                sj_img_release(ib);
                                 ib = refined;
-                                dict->glyphs[id] = refined;
                             }
                         }
                     /* (3c.vi) CURS update before position calc */
@@ -857,6 +852,9 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                         }
                     }
                         sj_img_compose(im,ib,(int)x_pos,(int)y_pos,(sj_compose_op)SBCOMBOP);
+                    /* Release refined image (not dictionary glyph) */
+                    if(ri && ib!=dict->glyphs[id]) sj_img_release(ib);
+                    ib = dict->glyphs[id];
                     /* (3c.x) CURS update after compose */
                     if(!TRANSPOSED&&REFCORNER<2) curs+=(int)ib->width-1;
                     else if(TRANSPOSED&&(REFCORNER&1)) curs+=(int)ib->height-1;
