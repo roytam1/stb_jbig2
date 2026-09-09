@@ -165,8 +165,7 @@ static int sj_img_compose(stb_jbig2_image *dst, stb_jbig2_image *src, int sx, in
         sj_u8 *s=ss, *d=dd;
         /* left byte */
         { sj_u8 v;
-          if (bytewidth==1) v=*s;
-          else { sj_u8 sl=(s>src->data)?*(s-1):0; v=(sj_u8)(((sl<<8)|s[0])>>shift); }
+          { sj_u8 sl=(s>src->data)?*(s-1):0; v=(sj_u8)(((sl<<8)|s[0])>>shift); }
           switch(op){
             case SJ_COMPOSE_OR:     *d|=v&lmask; break;
             case SJ_COMPOSE_AND:    *d&=(v&lmask)|~lmask; break;
@@ -850,8 +849,8 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                     } else {
                         switch(REFCORNER) {
                             case 0: /* BOTTOMLEFT */
-                                x_pos=(sj_u32)(stript+curt_val-(int)ib->width+1);
-                                y_pos=(sj_u32)curs;
+                                x_pos=(sj_u32)(stript+curt_val);
+                                y_pos=(sj_u32)(curs-(int)ib->height+1);
                                 break;
                             case 1: /* TOPLEFT */
                                 x_pos=(sj_u32)(stript+curt_val);
@@ -862,8 +861,8 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                                 y_pos=(sj_u32)(curs-(int)ib->height+1);
                                 break;
                             default: /* TOPRIGHT */
-                                x_pos=(sj_u32)(stript+curt_val);
-                                y_pos=(sj_u32)(curs-(int)ib->height+1);
+                                x_pos=(sj_u32)(stript+curt_val-(int)ib->width+1);
+                                y_pos=(sj_u32)curs;
                                 break;
                         }
                     }
