@@ -233,15 +233,25 @@ static const sj_qe sj_QE[47] = {
 static int sj_arith_renormd(sj_arith *as);
 static int sj_arith_bytein(sj_arith *as);
 
+static int sj_arith_load_word(sj_arith *as) {
+    sj_u32 val=0;
+    int ret=0;
+    if (as->offset>=as->data_size) return 0;
+    if (as->offset<as->data_size) { val|=(sj_u32)as->data[as->offset]<<24; ret++; }
+    if (as->offset+1<as->data_size) { val|=(sj_u32)as->data[as->offset+1]<<16; ret++; }
+    if (as->offset+2<as->data_size) { val|=(sj_u32)as->data[as->offset+2]<<8; ret++; }
+    if (as->offset+3<as->data_size) { val|=(sj_u32)as->data[as->offset+3]; ret++; }
+    as->next_word=val; as->next_word_bytes=(size_t)ret; as->offset+=(size_t)ret;
+    return ret;
+}
+
 static int sj_arith_bytein(sj_arith *as) {
     sj_u8 B, B1;
     if (as->err||as->next_word_bytes==0) return -1;
     B=(sj_u8)((as->next_word>>24)&0xFF);
     if (B==0xFF) {
         if (as->next_word_bytes<=1) {
-            if (as->offset+4>as->data_size) { as->next_word=0xFF900000; as->next_word_bytes=2; as->C+=0xFF00; as->CT=8; return 0; }
-            as->next_word=((sj_u32)as->data[as->offset]<<24)|((sj_u32)as->data[as->offset+1]<<16)|((sj_u32)as->data[as->offset+2]<<8)|(sj_u32)as->data[as->offset+3];
-            as->next_word_bytes=4; as->offset+=4;
+            if (sj_arith_load_word(as)==0) { as->next_word=0xFF900000; as->next_word_bytes=2; as->C+=0xFF00; as->CT=8; return 0; }
             B1=(sj_u8)((as->next_word>>24)&0xFF);
             if (B1>0x8F) { as->CT=8; as->next_word=0xFF000000|(as->next_word>>8); as->next_word_bytes=2; as->offset--; }
             else { as->C+=0xFE00-(B1<<9); as->CT=7; }
@@ -253,9 +263,7 @@ static int sj_arith_bytein(sj_arith *as) {
     } else {
         as->next_word<<=8; as->next_word_bytes--;
         if (as->next_word_bytes==0) {
-            if (as->offset+4>as->data_size) { as->next_word=0xFF900000; as->next_word_bytes=2; as->C+=0xFF00; as->CT=8; return 0; }
-            as->next_word=((sj_u32)as->data[as->offset]<<24)|((sj_u32)as->data[as->offset+1]<<16)|((sj_u32)as->data[as->offset+2]<<8)|(sj_u32)as->data[as->offset+3];
-            as->next_word_bytes=4; as->offset+=4;
+            if (sj_arith_load_word(as)==0) { as->next_word=0xFF900000; as->next_word_bytes=2; as->C+=0xFF00; as->CT=8; return 0; }
         }
         B=(sj_u8)((as->next_word>>24)&0xFF);
         as->C+=0xFF00-(B<<8); as->CT=8;
