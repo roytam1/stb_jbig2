@@ -609,12 +609,11 @@ static int sj_decode_imm_gen(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *s
  * For each pixel, a 13-bit (template0) or 10-bit (template1) context is built
  * from already-decoded output pixels and reference image pixels. */
 static stb_jbig2_image *sj_decode_refine_region(sj_arith *as,
-    stb_jbig2_image *ref, sj_i32 rdw, sj_i32 rdh, sj_i32 refdx, sj_i32 refdy, int tpl, sj_i8 grat[4])
+    stb_jbig2_image *ref, sj_i32 rdw, sj_i32 rdh, sj_i32 refdx, sj_i32 refdy, int tpl, sj_i8 grat[4],
+    sj_cx *gr_stats)
 {
     sj_u32 GRW, GRH, x, y;
     stb_jbig2_image *im;
-    sj_cx *gr_stats;
-    int ctx_sz;
     if (!ref) return NULL;
     { sj_i32 w2 = (sj_i32)ref->width + rdw, h2 = (sj_i32)ref->height + rdh;
       if (w2 <= 0 || h2 <= 0) return NULL;
@@ -622,9 +621,6 @@ static stb_jbig2_image *sj_decode_refine_region(sj_arith *as,
     }
     im = sj_img_new(GRW, GRH);
     if (!im) return NULL;
-    ctx_sz = tpl ? (1 << 10) : (1 << 13);
-    gr_stats = (sj_cx *)calloc((size_t)ctx_sz, sizeof(sj_cx));
-    if (!gr_stats) { sj_img_release(im); return NULL; }
     for (y = 0; y < GRH; y++) {
         sj_u32 out = 0; int bits = 8; sj_u8 *d = &im->data[y * im->stride];
         for (x = 0; x < GRW; x++) {
@@ -664,7 +660,6 @@ static stb_jbig2_image *sj_decode_refine_region(sj_arith *as,
         }
         if (bits != 8) *d = (sj_u8)(out << bits);
     }
-    free(gr_stats);
     return im;
 }
 
@@ -725,6 +720,7 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
         sj_i32 stript, firsts, curs, dt, dfs, ids;
         sj_u32 index;
         int iaidsz=0;
+        sj_cx *gr_stats=NULL;
         /* Count total symbols in referred dictionaries */
         for(index=0;index<seg->ref_seg_count;index++) {
             sj_seg *rs=sj_find_seg(ctx,seg->ref_segs[index]);
@@ -743,6 +739,10 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
         iari=sj_int_ctx_new(); iaid=sj_iaid_new((sj_u8)iaidsz);
         iardw=sj_int_ctx_new(); iardh=sj_int_ctx_new();
         iardx=sj_int_ctx_new(); iardy=sj_int_ctx_new();
+        {
+            int ctx_sz = SBRTEMPLATE ? (1 << 10) : (1 << 13);
+            gr_stats = (sj_cx *)calloc((size_t)ctx_sz, sizeof(sj_cx));
+        }
 
         /* 6.4.5 (1): decode STRIPT */
         { int rc=sj_int_decode(iadt,as,&stript); if(rc) goto text_done; }
@@ -809,7 +809,7 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                             sj_i32 refdx = (rdw >> 1) + rdx;
                             sj_i32 refdy = (rdh >> 1) + rdy;
                             stb_jbig2_image *refined = sj_decode_refine_region(as,
-                                ib, rdw, rdh, refdx, refdy, SBRTEMPLATE, sbrat);
+                                ib, rdw, rdh, refdx, refdy, SBRTEMPLATE, sbrat, gr_stats);
                             if (refined) {
                                 ib = refined;
                             }
@@ -860,12 +860,12 @@ static int sj_decode_text(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) 
                         }
                     }
                         sj_img_compose(im,ib,(int)x_pos,(int)y_pos,(sj_compose_op)SBCOMBOP);
-                    /* Release refined image (not dictionary glyph) */
-                    if(ri && ib!=dict->glyphs[id]) sj_img_release(ib);
-                    ib = dict->glyphs[id];
-                    /* (3c.x) CURS update after compose */
+                    /* (3c.x) CURS update after compose - must use refined glyph dimensions */
                     if(!TRANSPOSED&&REFCORNER<2) curs+=(int)ib->width-1;
                     else if(TRANSPOSED&&(REFCORNER&1)) curs+=(int)ib->height-1;
+                    /* Release refined image (not dictionary glyph) - after (3c.x) uses it */
+                    if(ri && ib!=dict->glyphs[id]) sj_img_release(ib);
+                    ib = dict->glyphs[id];
                     }
                     /* (3c.xi) NINSTANCES++ — per reference, inside for(;;) */
                     ninstances++;
@@ -878,7 +878,7 @@ text_done:
         sj_int_ctx_free(iari); sj_iaid_free(iaid);
         sj_int_ctx_free(iardw); sj_int_ctx_free(iardh);
         sj_int_ctx_free(iardx); sj_int_ctx_free(iardy);
-        free(as);
+        free(gr_stats); free(as);
     }
     seg->result=im;
     { sj_page *pg=&ctx->pages[ctx->cur_page];
