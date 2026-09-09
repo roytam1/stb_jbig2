@@ -135,6 +135,14 @@ static int sj_img_getpixel(stb_jbig2_image *im, int x, int y) {
     return (im->data[(x>>3)+y*im->stride] >> (7-(x&7))) & 1;
 }
 
+static void sj_img_setpixel(stb_jbig2_image *im, int x, int y, int v) {
+    sj_u8 *p;
+    if (x<0||y<0||x>=(int)im->width||y>=(int)im->height) return;
+    p=&im->data[(x>>3)+y*im->stride];
+    if (v) *p|=(sj_u8)(0x80>>(x&7));
+    else   *p&=(sj_u8)~(0x80>>(x&7));
+}
+
 static int sj_img_compose(stb_jbig2_image *dst, stb_jbig2_image *src, int sx, int sy, sj_compose_op op) {
     sj_u32 w,h,shift,bytewidth,j;
     sj_u8 *ss,*dd,lmask,rmask;
@@ -991,33 +999,205 @@ sym_done:
 /* --- Pattern dictionary (segment type 16) --- */
 static int sj_decode_pat_dict(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
     sj_pat_dict *dict; sj_u32 i;
-    (void)ctx;
-    if(seg->data_len<13) return -1;
+    sj_u8 flags; int hdmmr, hdtemplate;
+    sj_u32 hdpw, hdph, graymax, n;
+    stb_jbig2_image *image; sj_arith *as; sj_cx *stats;
+    int ss; sj_i8 gbat[8];
+    if(seg->data_len<7) return -1;
+    flags=sd[0];
+    hdmmr=flags&1; hdtemplate=(flags>>1)&3;
+    hdpw=sd[1]; hdph=sd[2];
+    graymax=sj_get32(sd+3);
+    n=graymax+1;
     dict=(sj_pat_dict*)calloc(1,sizeof(*dict)); if(!dict) return -1;
-    dict->HPW=sj_get32(sd+1); dict->HPH=sj_get32(sd+5);
-    dict->n=(int)(sj_get32(sd+9)+1);
-    dict->patterns=(stb_jbig2_image**)calloc(dict->n,sizeof(stb_jbig2_image*));
+    dict->HPW=hdpw; dict->HPH=hdph;
+    dict->n=(int)n;
+    dict->patterns=(stb_jbig2_image**)calloc(n?n:1,sizeof(stb_jbig2_image*));
     if(!dict->patterns){free(dict);return -1;}
-    for(i=0;i<(sj_u32)dict->n;i++) {
-        dict->patterns[i]=sj_img_new(dict->HPW,dict->HPH);
+    for(i=0;i<n;i++) {
+        dict->patterns[i]=sj_img_new(hdpw,hdph);
         if(dict->patterns[i]) sj_img_clear(dict->patterns[i],0);
     }
+    if(hdmmr) { seg->result=dict; return 0; }
+    /* Decode collective bitmap using arithmetic-coded generic region */
+    image=sj_img_new(hdpw*n,hdph);
+    if(!image){seg->result=dict;return 0;}
+    ss=sj_gensize(hdtemplate);
+    stats=(sj_cx*)calloc(ss,sizeof(sj_cx));
+    if(!stats){sj_img_release(image);seg->result=dict;return 0;}
+    /* Template: gbat[0]=-hdpw, gbat[1]=0, rest per spec 6.7.5 */
+    gbat[0]=(sj_i8)(-(int)hdpw); gbat[1]=0;
+    gbat[2]=-3; gbat[3]=-1;
+    gbat[4]=2; gbat[5]=-2;
+    gbat[6]=-2; gbat[7]=-2;
+    as=sj_arith_new(sd+7,seg->data_len-7);
+    if(as) {
+        sj_decode_gb(image,as,stats,hdtemplate,0,gbat);
+        free(as);
+    }
+    free(stats);
+    /* Copy out individual patterns from the collective bitmap */
+    for(i=0;i<n;i++) {
+        sj_u32 px,py;
+        if(!dict->patterns[i]) continue;
+        for(py=0;py<hdph;py++) {
+            for(px=0;px<hdpw;px++) {
+                sj_img_setpixel(dict->patterns[i],(int)px,(int)py,
+                    sj_img_getpixel(image,(int)(i*hdpw+px),(int)py));
+            }
+        }
+    }
+    sj_img_release(image);
     seg->result=dict;
     return 0;
 }
 
 /* --- Halftone region (segment types 20,22,23) --- */
 static int sj_decode_halftone(stb_jbig2_context *ctx, sj_seg *seg, const sj_u8 *sd) {
-    sj_u32 HGW,HGH,X,Y; sj_u32 comp_op;
+    sj_u32 GBW,GBH,X,Y; sj_u32 comp_op;
+    sj_u32 HMMR,HTEMPLATE,HENABLESKIP,HCOMBOP,HDEFPIXEL;
+    sj_u32 HGW,HGH;
+    sj_i32 HGX,HGY;
+    sj_u16 HRX,HRY;
+    sj_u32 offset;
     stb_jbig2_image *im;
-    if(seg->data_len<20) return -1;
-    HGW=sj_get32(sd); HGH=sj_get32(sd+4);
-    comp_op=(sd[20]>>4)&7;
-    im=sj_img_new(HGW,HGH); if(!im) return -1;
-    sj_img_clear(im,0);
+    sj_pat_dict *hpats=NULL;
+    sj_u32 i;
+    if(seg->data_len<38) return -1;
+    /* 7.4.5.1 - Region segment info (17 bytes) */
+    GBW=sj_get32(sd); GBH=sj_get32(sd+4); X=sj_get32(sd+8); Y=sj_get32(sd+12);
+    comp_op=sd[16]&7;
+    offset=17;
+    /* 7.4.5.1.1 - Halftone flags */
+    { sj_u8 hf=sd[offset]; HMMR=hf&1; HTEMPLATE=(hf>>1)&3; HENABLESKIP=(hf>>3)&1;
+      HCOMBOP=(hf>>4)&7; HDEFPIXEL=(hf>>7)&1; }
+    offset++;
+    /* 7.4.5.1.2 - Grid size and offset */
+    HGW=sj_get32(sd+offset); HGH=sj_get32(sd+offset+4);
+    { sj_u32 hx=sj_get32(sd+offset+8), hy=sj_get32(sd+offset+12);
+      HGX=(sj_i32)hx; HGY=(sj_i32)hy; }
+    offset+=16;
+    /* 7.4.5.1.3 - Rotation vector */
+    HRX=sj_get16(sd+offset); HRY=sj_get16(sd+offset+2);
+    offset+=4;
+    /* Get pattern dictionary from referred-to segments */
+    for(i=0;i<(sj_u32)seg->ref_seg_count&&!hpats;i++) {
+        sj_seg *rseg=NULL;
+        sj_u32 j;
+        for(j=0;j<ctx->n_segs;j++) {
+            if(ctx->segs[j]->number==seg->ref_segs[i]){rseg=ctx->segs[j];break;}
+        }
+        if(rseg&&(rseg->flags&63)==16&&rseg->result) hpats=(sj_pat_dict*)rseg->result;
+    }
+    if(!hpats||hpats->n==0) return -1;
+    /* Create halftone image */
+    im=sj_img_new(GBW,GBH); if(!im) return -1;
+    /* 6.6.5(1): Fill with HDEFPIXEL */
+    sj_img_clear(im,(int)HDEFPIXEL);
+    if(HMMR) { /* MMR not supported yet */ sj_img_release(im); return -1; }
+    {
+        sj_u32 HBPP=0, HNUMPATS=(sj_u32)hpats->n;
+        sj_u32 gsstride;
+        sj_u8 **gsplanes=NULL;
+        sj_u16 **GI=NULL;
+        sj_u32 ng,mg;
+        /* 6.6.5(3): HBPP = ceil(log2(HNUMPATS)) */
+        { sj_u32 tmp=HNUMPATS; while(tmp>(1U<<HBPP)) HBPP++; }
+        if(HBPP>16) { sj_img_release(im); return -1; }
+        if(HBPP==0) HBPP=1;
+        /* 6.6.5(4): Decode gray-scale image (annex C.5) */
+        gsstride=((HGW+7)>>3);
+        gsplanes=(sj_u8**)calloc(HBPP,sizeof(sj_u8*));
+        if(!gsplanes){sj_img_release(im);return -1;}
+        for(i=0;i<HBPP;i++) {
+            gsplanes[i]=(sj_u8*)calloc((size_t)gsstride*HGH,1);
+            if(!gsplanes[i]){sj_u32 j; for(j=0;j<i;j++) free(gsplanes[j]); free(gsplanes); sj_img_release(im); return -1;}
+        }
+        /* C.5 step 1: Decode each bitplane */
+        { int gb_ss=sj_gensize(HTEMPLATE);
+          sj_cx *gb_stats=(sj_cx*)calloc(gb_ss,sizeof(sj_cx));
+          sj_i8 gb_gbat[8];
+          gb_gbat[0]=(HTEMPLATE<=1)?3:2; gb_gbat[1]=-1;
+          gb_gbat[2]=-3; gb_gbat[3]=-1;
+          gb_gbat[4]=2; gb_gbat[5]=-2;
+          gb_gbat[6]=-2; gb_gbat[7]=-2;
+          if(gb_stats) {
+              sj_arith *as=sj_arith_new(sd+offset,seg->data_len-offset);
+              if(as) {
+                  /* C.5 step 1: Decode GSPLANES[GSBPP-1] first, then GSBPP-2 down to 0 */
+                  { sj_u32 bp;
+                    for(bp=0;bp<HBPP;bp++) {
+                        stb_jbig2_image plane;
+                        sj_u32 idx=HBPP-1-bp;
+                        plane.width=HGW; plane.height=HGH;
+                        plane.stride=gsstride; plane.data=gsplanes[idx]; plane.refcount=0;
+                        sj_decode_gb(&plane,as,gb_stats,(int)HTEMPLATE,0,gb_gbat);
+                    }
+                  }
+                  free(as);
+              }
+              free(gb_stats);
+          }
+        }
+        /* C.5 step 3b: XOR consecutive bitplanes */
+        for(i=HBPP-1;i>0;i--) {
+            sj_u32 sz=(size_t)gsstride*HGH;
+            sj_u32 k;
+            for(k=0;k<sz;k++) gsplanes[i-1][k]^=gsplanes[i][k];
+        }
+        /* C.5 step 4: Build GSVALS from bitplanes */
+        GI=(sj_u16**)calloc(HGW,sizeof(sj_u16*));
+        if(GI) {
+            for(ng=0;ng<HGW;ng++) {
+                GI[ng]=(sj_u16*)calloc(HGH,sizeof(sj_u16));
+                if(!GI[ng]){sj_u32 k; for(k=0;k<ng;k++) free(GI[k]); free(GI); GI=NULL; break;}
+                for(mg=0;mg<HGH;mg++) {
+                    sj_u16 val=0;
+                    for(i=0;i<HBPP;i++) {
+                        val+=(sj_u16)((gsplanes[i][mg*gsstride+(ng>>3)]>>(7-(ng&7)))&1)<<i;
+                    }
+                    GI[ng][mg]=val;
+                }
+            }
+        }
+        /* Free bitplanes */
+        for(i=0;i<HBPP;i++) free(gsplanes[i]);
+        free(gsplanes);
+        /* 6.6.5(5): Place patterns */
+        if(GI) {
+            for(mg=0;mg<HGH;mg++) {
+                for(ng=0;ng<HGW;ng++) {
+                    sj_u16 gv=GI[ng][mg];
+                    sj_u32 px,py;
+                    sj_i32 gx,gy;
+                    if(gv>=HNUMPATS) gv=(sj_u16)(HNUMPATS-1);
+                    if(!hpats->patterns[gv]) continue;
+                    /* Grid position: (HGX + mg*HRY + ng*HRX) >> 8 */
+                    { sj_i32 hrx=(sj_i32)HRX, hry=(sj_i32)HRY;
+                      sj_i32 mx=(sj_i32)mg, nx=(sj_i32)ng;
+                      gx = (sj_i32)(((HGX + mx*hry + nx*hrx) >> 8));
+                      gy = (sj_i32)(((HGY + mx*hrx - nx*hry) >> 8));
+                    }
+                    /* Compose pattern onto halftone image */
+                    for(py=0;py<hpats->HPH;py++) {
+                        int dyy=(int)(gy+py);
+                        if(dyy<0||dyy>=(int)GBH) continue;
+                        for(px=0;px<hpats->HPW;px++) {
+                            int dxx=(int)(gx+px);
+                            if(dxx<0||dxx>=(int)GBW) continue;
+                            if(sj_img_getpixel(hpats->patterns[gv],(int)px,(int)py)) {
+                                sj_img_setpixel(im,dxx,dyy,1);
+                            }
+                        }
+                    }
+                }
+            }
+            for(ng=0;ng<HGW;ng++) free(GI[ng]);
+            free(GI);
+        }
+    }
     seg->result=im;
     { sj_page *pg=&ctx->pages[ctx->cur_page];
-      X=sj_get32(sd+21); Y=sj_get32(sd+25);
       if(pg->image) sj_img_compose(pg->image,im,(int)X,(int)Y,(sj_compose_op)comp_op);
     }
     return 0;
