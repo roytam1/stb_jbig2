@@ -21,6 +21,7 @@ extern "C" {
 
 unsigned char *stb_jbig2_decode(const unsigned char *data, int size, int *width, int *height);
 unsigned char *stb_jbig2_decode_embedded(const unsigned char *data, int size, int *width, int *height);
+unsigned char *stb_jbig2_decode_file(const char *filename, int *width, int *height);
 void stb_jbig2_free(void *p);
 
 typedef struct stb_jbig2_context stb_jbig2_context;
@@ -52,6 +53,7 @@ stb_jbig2_context *stb_jbig2_create_ex(int options, stb_jbig2_context *shared);
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 typedef unsigned char  sj_u8;
 typedef unsigned short sj_u16;
@@ -1414,6 +1416,38 @@ unsigned char *stb_jbig2_decode_embedded(const unsigned char *data, int size, in
 }
 
 void stb_jbig2_free(void *p) { free(p); }
+
+unsigned char *stb_jbig2_decode_file(const char *filename, int *width, int *height) {
+    FILE *f; unsigned char *data; long size;
+    unsigned char *bits, *rgb;
+    int w, h, x, y;
+    f = fopen(filename, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); size = ftell(f); fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return NULL; }
+    data = (unsigned char *)malloc((size_t)size);
+    if (!data) { fclose(f); return NULL; }
+    if ((long)fread(data, 1, (size_t)size, f) != size) { free(data); fclose(f); return NULL; }
+    fclose(f);
+    bits = stb_jbig2_decode(data, (int)size, &w, &h);
+    free(data);
+    if (!bits) return NULL;
+    rgb = (unsigned char *)malloc((size_t)w * (size_t)h * 3);
+    if (rgb) {
+        int stride = (w + 7) >> 3;
+        for (y = 0; y < h; y++) {
+            for (x = 0; x < w; x++) {
+                int bit = (bits[y * stride + (x >> 3)] >> (7 - (x & 7))) & 1;
+                unsigned char c = bit ? 0 : 255;
+                int off = (y * w + x) * 3;
+                rgb[off] = c; rgb[off+1] = c; rgb[off+2] = c;
+            }
+        }
+    }
+    stb_jbig2_free(bits);
+    *width = w; *height = h;
+    return rgb;
+}
 
 #endif /* STB_JBIG2__IMPLEMENTATION_ONCE */
 #endif /* STB_JBIG2_IMPLEMENTATION */

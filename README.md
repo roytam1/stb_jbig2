@@ -18,16 +18,32 @@ A single-file JBIG2 decoder library written in C89, following the [stb](https://
 
 ## Usage
 
+### Decode from file (simplest)
+
 ```c
 #define STB_JBIG2_IMPLEMENTATION
 #include "stb_jbig2.h"
 
-/* Decode a complete JBIG2 file */
-int width, height;
-unsigned char *pixels = stb_jbig2_decode(data, data_len, &width, &height);
+int w, h;
+unsigned char *rgb = stb_jbig2_decode_file("scan.jb2", &w, &h);
+if (rgb) {
+    /* rgb is 24bpp row-major RGB (3 bytes/pixel, 0=black 255=white) */
+    /* ... */
+    stb_jbig2_free(rgb);
+}
+```
+
+### Decode from memory
+
+```c
+#define STB_JBIG2_IMPLEMENTATION
+#include "stb_jbig2.h"
+
+int w, h;
+unsigned char *pixels = stb_jbig2_decode(data, data_len, &w, &h);
 if (pixels) {
     /* pixels is 1bpp, MSB-first, row stride = (width+7)/8 */
-    process_image(pixels, width, height);
+    process_image(pixels, w, h);
     stb_jbig2_free(pixels);
 }
 ```
@@ -83,7 +99,15 @@ cl /W4 /O2 test_jbig2.c
 unsigned char *stb_jbig2_decode(const unsigned char *data, int size, int *width, int *height);
 ```
 
-Decode an entire JBIG2 file. Returns a newly allocated 1bpp bitmap (MSB-first), or `NULL` on failure. Free with `stb_jbig2_free()`.
+Decode an entire JBIG2 file from memory. Returns a newly allocated 1bpp bitmap (MSB-first), or `NULL` on failure. Free with `stb_jbig2_free()`.
+
+### File decode (24bpp)
+
+```c
+unsigned char *stb_jbig2_decode_file(const char *filename, int *width, int *height);
+```
+
+Read a JBIG2 file and decode it. Returns a newly allocated 24bpp RGB bitmap (3 bytes per pixel, row-major, 0=black 255=white), or `NULL` on failure. Free with `stb_jbig2_free()`.
 
 ### Streaming decode
 
@@ -130,7 +154,6 @@ Tested against jbig2dec-0.20 (Artifex reference implementation):
 ## Limitations
 
 - Only decodes JBIG2 (not JBIG2 in PDF containers -- extract the JBIG2 stream first)
-- 1-bit output only (no grayscale or color)
 - Requires `-O3` for good performance (inlining is critical)
 
 ## License
