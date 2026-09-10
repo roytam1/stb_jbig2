@@ -125,7 +125,7 @@ Tested against jbig2dec-0.20 (Artifex reference implementation):
 | 005 | 0 / 8,471,520 | 0.0000% |
 | 006_page0 | 0 / 8,329,152 | 0.0000% |
 | amb_1 | 0 / 960,000 | 0.0000% |
-| text | 51 / 3,475,425 | 0.0015% |
+| text | 0 / 3,475,425 | 0.0000% |
 
 ## Limitations
 
