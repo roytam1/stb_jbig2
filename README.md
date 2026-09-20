@@ -24,10 +24,11 @@ A single-file JBIG2 decoder library written in C89, following the [stb](https://
 #define STB_JBIG2_IMPLEMENTATION
 #include "stb_jbig2.h"
 
-int w, h;
-unsigned char *rgb = stb_jbig2_decode_file("scan.jb2", &w, &h);
+int w, h, num_pages;
+unsigned char *rgb = stb_jbig2_decode_file("scan.jb2", 0, &w, &h, &num_pages);
 if (rgb) {
     /* rgb is 24bpp row-major RGB (3 bytes/pixel, 0=black 255=white) */
+    /* page 0 of num_pages decoded */
     /* ... */
     stb_jbig2_free(rgb);
 }
@@ -104,10 +105,10 @@ Decode an entire JBIG2 file from memory. Returns a newly allocated 1bpp bitmap (
 ### File decode (24bpp)
 
 ```c
-unsigned char *stb_jbig2_decode_file(const char *filename, int *width, int *height);
+unsigned char *stb_jbig2_decode_file(const char *filename, int page, int *width, int *height, int *num_pages);
 ```
 
-Read a JBIG2 file and decode it. Returns a newly allocated 24bpp RGB bitmap (3 bytes per pixel, row-major, 0=black 255=white), or `NULL` on failure. Free with `stb_jbig2_free()`.
+Read a JBIG2 file and decode the requested zero-based `page`. Returns a newly allocated 24bpp RGB bitmap (3 bytes per pixel, row-major, 0=black 255=white), or `NULL` on failure (e.g. bad filename or out-of-range page). `num_pages` receives the total page count (may be `NULL`). Free with `stb_jbig2_free()`.
 
 ### Streaming decode
 
